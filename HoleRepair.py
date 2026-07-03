@@ -131,9 +131,10 @@ class HoleDetector:
     适用于参数化 CAD 模型（面上有内孔 Wire）。
     """
 
-    def __init__(self, rel_tolerance=30.0, min_edges=6):
+    def __init__(self, rel_tolerance=30.0, min_edges=6, max_radius=20.0):
         self.rel_tolerance = rel_tolerance
         self.min_edges = min_edges
+        self.max_radius = max_radius
 
     def detect(self, shape) -> List[HoleInfo]:
         results = []
@@ -154,7 +155,7 @@ class HoleDetector:
                     continue
                 center, radius, normal, max_dev = fit
                 rel_dev = max_dev / radius * 100 if radius > 0 else float('inf')
-                is_circ = rel_dev < self.rel_tolerance
+                is_circ = rel_dev < self.rel_tolerance and radius <= self.max_radius
                 results.append(HoleInfo(
                     face_index=fi, face=face, wire_index=wi, wire=wire,
                     n_edges=len(edges), points=pts, is_circular=is_circ,
@@ -355,7 +356,7 @@ class FaceClusterDetector:
 # ============================================================================
 
 def detect_holes(shape, rel_tolerance=30.0, min_edges=6,
-                 max_face_area=5.0, radius_tolerance=0.3):
+                 max_radius=20.0, max_face_area=5.0, radius_tolerance=0.3):
     """
     自动选择检测模式：
     - 有 inner wire 的面 → 模式 A
@@ -365,7 +366,7 @@ def detect_holes(shape, rel_tolerance=30.0, min_edges=6,
     results = []
 
     # 模式 A
-    detector_a = HoleDetector(rel_tolerance=rel_tolerance, min_edges=min_edges)
+    detector_a = HoleDetector(rel_tolerance=rel_tolerance, min_edges=min_edges, max_radius=max_radius)
     wire_results = detector_a.detect(shape)
     results.extend(wire_results)
 
@@ -430,6 +431,12 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self.spin_min.setRange(3, 200)
         self.spin_min.setValue(6)
         fl.addRow("最小边数/聚类面数:", self.spin_min)
+
+        self.spin_max_r = QtWidgets.QDoubleSpinBox()
+        self.spin_max_r.setRange(0.1, 10000.0)
+        self.spin_max_r.setValue(20.0)
+        self.spin_max_r.setSuffix(" mm")
+        fl.addRow("最大圆弧半径:", self.spin_max_r)
 
         self.spin_area = QtWidgets.QDoubleSpinBox()
         self.spin_area.setRange(0.1, 1000.0)
@@ -525,6 +532,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
             shape,
             rel_tolerance=self.spin_tol.value(),
             min_edges=self.spin_min.value(),
+            max_radius=self.spin_max_r.value(),
             max_face_area=self.spin_area.value(),
             radius_tolerance=self.spin_rtol.value(),
         )
