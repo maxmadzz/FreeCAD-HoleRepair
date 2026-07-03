@@ -648,18 +648,26 @@ class HoleRepairDialog(QtWidgets.QDialog):
                 c3d = centroid + u_vec * cx2 + v_vec * cy2
                 c = Base.Vector(c3d[0], c3d[1], c3d[2])
 
-                # 判断孔方向
-                if n.z > 0:  # 面朝上 → 孔向下
-                    cover_dir = n
-                    pocket_dir = Base.Vector(0, 0, -1)
-                    pocket_len = c.z - bb.ZMin + 1
-                else:  # 面朝下 → 孔向上
-                    cover_dir = n
-                    pocket_dir = Base.Vector(0, 0, 1)
-                    pocket_len = bb.ZMax - c.z + 1
+                # 孔面法线方向
+                fn = face.normalAt(0.5, 0.5)
+                n = Base.Vector(fn.x, fn.y, fn.z)
 
+                # 圆心位置
+                c = Base.Vector(c3d[0], c3d[1], c3d[2])
+
+                # 盖片：R×1.15（充分覆盖多边形顶点），厚 0.1mm，居中于面
                 covers.append(Part.makeCylinder(
-                    radius * 1.02, 1, c, cover_dir))
+                    radius * 1.15, 0.1,
+                    Base.Vector(c.x - n.x * 0.05, c.y - n.y * 0.05, c.z - n.z * 0.05), n))
+
+                # Pocket：从面中心向模型内部贯穿到底
+                if n.z > 0:
+                    pocket_len = c.z - bb.ZMin + 0.5
+                    pocket_dir = Base.Vector(0, 0, -1)
+                else:
+                    pocket_len = bb.ZMax - c.z + 0.5
+                    pocket_dir = Base.Vector(0, 0, 1)
+
                 pockets.append(Part.makeCylinder(
                     radius, pocket_len, c, pocket_dir))
                 count += 1
