@@ -600,14 +600,18 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._do_rebuild(indices)
 
     def _do_rebuild(self, indices):
-        """批量 Cover+Pocket 法重建圆孔。
+        """局部深度 Cover+Pocket 法重建圆孔。
 
-        1. 合并所有盖片（R×1.02）为单一形状
-        2. 一次 Fuse 到模型
-        3. 合并所有 Pocket（精确R）为单一形状
-        4. 一次 Cut
+        对每个检测到的圆弧孔：
+        1. 判断面的法线方向（朝上/朝下）
+        2. 沿法线方向创建盖片（1mm 厚）
+        3. 沿法线反方向创建 Pocket（到模型边缘）
+        4. 批量合并后一次 Fuse + 一次 Cut
 
-        优点：BB 完全不变，不影响周围几何，布尔运算次数少。
+        优点：
+        - 只影响孔附近的局部区域，不超出模型
+        - BB 几乎不变（±2mm）
+        - 不影响周围几何（阶梯、槽等）
         """
         if not self.shape_obj or not indices:
             return
@@ -615,8 +619,6 @@ class HoleRepairDialog(QtWidgets.QDialog):
         doc = FreeCAD.ActiveDocument
         result_shape = self.shape_obj.Shape
         bb = result_shape.BoundBox
-        Zmin, Zmax = bb.ZMin, bb.ZMax
-        h = Zmax - Zmin
 
         covers = []
         pockets = []
@@ -627,11 +629,14 @@ class HoleRepairDialog(QtWidgets.QDialog):
 
             if info.detection_mode == "wire" and info.is_circular:
                 pts = [v.Point for v in info.wire.Vertexes]
+                face = self.shape_obj.Shape.Faces[info.face_index]
+                fn = face.normalAt(0.5, 0.5)
+                n = Base.Vector(fn.x, fn.y, fn.z)
+
                 coords = np.array([(p.x, p.y, p.z) for p in pts])
                 centroid = coords.mean(axis=0)
                 centered = coords - centroid
                 _, _, vh = np.linalg.svd(centered)
-                n_vec = vh[2]
                 u_vec, v_vec = vh[0], vh[1]
                 coords_2d = centered @ np.column_stack([u_vec, v_vec])
                 x, y = coords_2d[:, 0], coords_2d[:, 1]
@@ -641,35 +646,48 @@ class HoleRepairDialog(QtWidgets.QDialog):
                 cx2, cy2 = -D / 2, -E / 2
                 radius = math.sqrt(cx2 ** 2 + cy2 ** 2 - F)
                 c3d = centroid + u_vec * cx2 + v_vec * cy2
+                c = Base.Vector(c3d[0], c3d[1], c3d[2])
+
+                # 判断孔方向
+                if n.z > 0:  # 面朝上 → 孔向下
+                    cover_dir = n
+                    pocket_dir = Base.Vector(0, 0, -1)
+                    pocket_len = c.z - bb.ZMin + 1
+                else:  # 面朝下 → 孔向上
+                    cover_dir = n
+                    pocket_dir = Base.Vector(0, 0, 1)
+                    pocket_len = bb.ZMax - c.z + 1
 
                 covers.append(Part.makeCylinder(
-                    radius * 1.02, h,
-                    Base.Vector(c3d[0], c3d[1], Zmin),
-                    Base.Vector(0, 0, 1)))
+                    radius * 1.02, 1, c, cover_dir))
                 pockets.append(Part.makeCylinder(
-                    radius, h,
-                    Base.Vector(c3d[0], c3d[1], Zmin),
-                    Base.Vector(0, 0, 1)))
+                    radius, pocket_len, c, pocket_dir))
                 count += 1
 
             elif info.detection_mode == "cluster" and info.is_cylindrical:
+                # 聚类检测模式：用面法线方向
                 c = info.cyl_center
+                n = info.cyl_normal
                 radius = info.cyl_radius
+
+                if n.z > 0:
+                    pocket_dir = Base.Vector(0, 0, -1)
+                    pocket_len = c.z - bb.ZMin + 1
+                else:
+                    pocket_dir = Base.Vector(0, 0, 1)
+                    pocket_len = bb.ZMax - c.z + 1
+
                 covers.append(Part.makeCylinder(
-                    radius * 1.02, h,
-                    Base.Vector(c.x, c.y, Zmin),
-                    Base.Vector(0, 0, 1)))
+                    radius * 1.02, 1, c, n))
                 pockets.append(Part.makeCylinder(
-                    radius, h,
-                    Base.Vector(c.x, c.y, Zmin),
-                    Base.Vector(0, 0, 1)))
+                    radius, pocket_len, c, pocket_dir))
                 count += 1
 
         if count == 0:
             self._log("没有可重建的孔洞")
             return
 
-        self._log("合并 %d 个盖片中..." % len(covers))
+        self._log("批量合并 %d 个盖片中..." % len(covers))
         cover_multi = covers[0]
         for c in covers[1:]:
             cover_multi = cover_multi.fuse(c)
@@ -677,7 +695,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._log("Fuse 盖片到模型...")
         result_shape = result_shape.fuse(cover_multi)
 
-        self._log("合并 %d 个 pocket 中..." % len(pockets))
+        self._log("批量合并 %d 个 pocket 中..." % len(pockets))
         pocket_multi = pockets[0]
         for p in pockets[1:]:
             pocket_multi = pocket_multi.fuse(p)
