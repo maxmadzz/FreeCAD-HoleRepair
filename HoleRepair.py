@@ -134,11 +134,12 @@ class HoleDetector:
                     continue
 
                 # 收集离散点
+                # 只用顶点（圆应过顶点）
                 pts = []
-                for e in edges:
-                    pts.extend(e.discretize(20))
+                for v in wire.Vertexes:
+                    pts.append(v.Point)
 
-                if len(pts) < 10:
+                if len(pts) < self.min_edges:
                     continue
 
                 # Kasa 圆拟合
