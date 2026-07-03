@@ -3,13 +3,11 @@
 FreeCAD Workbench InitGui
 B-Rep 孔洞圆弧检测与重建插件
 """
+import FreeCADGui
 
 
-class HoleRepairWorkbench:
+class HoleRepairWorkbench(FreeCADGui.Workbench):
     """FreeCAD 工作台：孔洞修复"""
-
-    def __init__(self):
-        pass
 
     def GetClassName(self):
         return "Gui::PythonWorkbench"
@@ -27,29 +25,16 @@ class HoleRepairWorkbench:
             return icon_path
         return ""
 
-    def Setup(self):
+    def Initialize(self):
         """设置工作台"""
-        import FreeCADGui
+        from HoleRepair import HoleRepairCommand
+        FreeCADGui.addCommand('HoleRepairCommand', HoleRepairCommand())
 
-        # 注册命令
-        from HoleRepair import register
-        register()
-
-        # 创建菜单
-        self.appendMenu(
-            "孔洞修复",
-            ["HoleRepairCommand"]
-        )
-
-        # 创建工具栏
-        self.appendToolbar(
-            "孔洞修复",
-            ["HoleRepairCommand"]
-        )
+        self.appendMenu("孔洞修复", ["HoleRepairCommand"])
+        self.appendToolbar("孔洞修复", ["HoleRepairCommand"])
 
         FreeCAD.Console.PrintMessage("孔洞修复工作台已加载\n")
 
 
 # 注册工作台
-wb = HoleRepairWorkbench()
-FreeCADGui.addWorkbench(wb)
+FreeCADGui.addWorkbench(HoleRepairWorkbench())
