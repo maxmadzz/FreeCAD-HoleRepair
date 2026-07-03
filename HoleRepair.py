@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FreeCAD 插件：STL B-Rep 多边形孔 → 圆弧重建
+FreeCAD 插件：B-Rep 多边形孔 → 圆孔重建
 
 工作流程（参考 AnalysisSitus asiAlgo_RecognizeCanonical::FitCircle）：
-1. 从 B-Rep 中提取边界边（只属于 1 个面的边）
-2. 按端点连接分组为闭合环
-3. 对每个环做 Kasa 最小二乘圆拟合
+1. 遍历 B-Rep 每个 Face
+2. 检查 Face 内部 Wire（inner wire = 孔洞边界）
+3. 对每个 inner wire 做 Kasa 最小二乘圆拟合
 4. 相对偏差 < 容差 → 判定为多边形圆弧孔
-5. 用 Part.Circle 重建为真正的圆弧 Face
+5. 用 Part.Circle 替换 inner wire，重建 Face
 
 适用场景：STL mesh → B-Rep 转换后，圆孔变成多边形碎边
 依赖：FreeCAD 1.0+（内置 numpy）
@@ -32,94 +32,32 @@ from PySide6 import QtWidgets, QtCore
 # ============================================================================
 
 @dataclass
-class BoundaryLoop:
-    """边界环信息"""
-    edges: list                          # Part.Edge 列表
-    points: list = field(default_factory=list)  # 离散点
+class HoleInfo:
+    """孔洞信息"""
+    face_index: int                     # 所在面索引
+    face: object = None                 # Part.Face
+    wire_index: int = 0                 # inner wire 索引
+    wire: object = None                 # Part.Wire
     n_edges: int = 0
+    points: list = field(default_factory=list)
     is_circular: bool = False
     fit_center: Optional[Base.Vector] = None
     fit_radius: float = 0.0
     fit_normal: Optional[Base.Vector] = None
     fit_max_dev: float = float('inf')
-    fit_rel_dev: float = float('inf')    # 相对偏差 (%)
-    replacement_face: object = None
+    fit_rel_dev: float = float('inf')   # 相对偏差 (%)
+    replacement_face: object = None     # 重建后的面
 
 
 # ============================================================================
-# 边界提取（参考 AnalysisSitus asiAlgo_CompleteEdgeLoop）
-# ============================================================================
-
-def extract_boundary_loops(shape, min_edges=3) -> List[List]:
-    """
-    从 B-Rep Shape 提取开放边界 edge，按拓扑连接分组为闭合环。
-    算法：
-    1. 统计每条 edge 被多少个面共享
-    2. 只属于 1 个面的 edge = 边界边
-    3. 按端点连接分组
-    """
-    # 1. 统计共享面数
-    edge_count = {}
-    for face in shape.Faces:
-        for edge in face.Edges:
-            h = edge.hashCode()
-            edge_count[h] = edge_count.get(h, 0) + 1
-
-    # 2. 收集边界边
-    boundary = []
-    seen = set()
-    for face in shape.Faces:
-        for edge in face.Edges:
-            h = edge.hashCode()
-            if edge_count[h] == 1 and h not in seen:
-                seen.add(h)
-                boundary.append(edge)
-
-    if not boundary:
-        return []
-
-    # 3. 按端点连接分组
-    def edges_connected(e1, e2, tol=0.01):
-        for p1 in [e1.Vertexes[0].Point, e1.Vertexes[-1].Point]:
-            for p2 in [e2.Vertexes[0].Point, e2.Vertexes[-1].Point]:
-                if p1.distanceToPoint(p2) < tol:
-                    return True
-        return False
-
-    wires = []
-    used = set()
-    for i, e1 in enumerate(boundary):
-        if i in used:
-            continue
-        wire = [e1]
-        used.add(i)
-        changed = True
-        while changed:
-            changed = False
-            for j, e2 in enumerate(boundary):
-                if j in used:
-                    continue
-                for we in wire:
-                    if edges_connected(we, e2):
-                        wire.append(e2)
-                        used.add(j)
-                        changed = True
-                        break
-        if len(wire) >= min_edges:
-            wires.append(wire)
-
-    return wires
-
-
-# ============================================================================
-# Kasa 圆拟合（与 AnalysisSitus FitCircle 同源思路）
+# Kasa 最小二乘圆拟合（与 AnalysisSitus FitCircle 同源思路）
 # ============================================================================
 
 def fit_circle_kasa(points) -> Optional[Tuple]:
     """
     Kasa 最小二乘圆拟合。
     x² + y² + Dx + Ey + F = 0
-    返回 (center_3d, radius, normal, max_deviation) 或 None。
+    返回 (center_3d_Vector, radius, normal_Vector, max_deviation) 或 None。
     """
     n = len(points)
     if n < 6:
@@ -163,77 +101,94 @@ def fit_circle_kasa(points) -> Optional[Tuple]:
 
 
 # ============================================================================
-# 圆弧检测与重建
+# 孔洞检测：遍历 Face 的 inner Wire
 # ============================================================================
 
-class CircularHoleDetector:
+class HoleDetector:
     """
-    检测 B-Rep 中的多边形圆弧孔并重建。
+    检测 B-Rep Face 中的多边形孔洞（inner Wire）。
     参考 AnalysisSitus asiAlgo_RecognizeCanonical。
     """
 
-    def __init__(self, rel_tolerance=30.0, min_edges=8):
-        """
-        rel_tolerance: 相对偏差容差 (% of radius)
-        min_edges: 最小边数（少于此数不判定为圆弧）
-        """
+    def __init__(self, rel_tolerance=30.0, min_edges=6):
         self.rel_tolerance = rel_tolerance
         self.min_edges = min_edges
 
-    def detect_and_rebuild(self, shape) -> List[BoundaryLoop]:
+    def detect(self, shape) -> List[HoleInfo]:
         """
-        检测所有边界环，判定圆弧，创建替换面。
-        返回 BoundaryLoop 列表。
+        遍历所有 Face，检查 inner Wire。
+        返回 HoleInfo 列表。
         """
-        loops = extract_boundary_loops(shape, min_edges=3)
         results = []
 
-        for loop_edges in loops:
-            # 收集离散点
-            pts = []
-            for e in loop_edges:
-                pts.extend(e.discretize(20))
+        for fi, face in enumerate(shape.Faces):
+            wires = face.Wires
+            if len(wires) < 2:
+                continue  # 没有 inner wire
 
-            if len(pts) < 10:
-                continue
+            # Wire[0] 是外边界，Wire[1:] 是内孔
+            for wi in range(1, len(wires)):
+                wire = wires[wi]
+                edges = wire.Edges
+                if len(edges) < self.min_edges:
+                    continue
 
-            # Kasa 圆拟合
-            fit = fit_circle_kasa(pts)
-            if fit is None:
-                results.append(BoundaryLoop(
-                    edges=loop_edges, points=pts, n_edges=len(loop_edges)
-                ))
-                continue
+                # 收集离散点
+                pts = []
+                for e in edges:
+                    pts.extend(e.discretize(20))
 
-            center, radius, normal, max_dev = fit
-            rel_dev = max_dev / radius * 100
+                if len(pts) < 10:
+                    continue
 
-            info = BoundaryLoop(
-                edges=loop_edges,
-                points=pts,
-                n_edges=len(loop_edges),
-                is_circular=(rel_dev < self.rel_tolerance and len(loop_edges) >= self.min_edges),
-                fit_center=center,
-                fit_radius=radius,
-                fit_normal=normal,
-                fit_max_dev=max_dev,
-                fit_rel_dev=rel_dev,
-            )
+                # Kasa 圆拟合
+                fit = fit_circle_kasa(pts)
+                if fit is None:
+                    continue
 
-            # 创建替换面
-            if info.is_circular:
-                try:
-                    circ = Part.Circle()
-                    circ.Center = center
-                    circ.Axis = normal
-                    circ.Radius = radius
-                    circ_edge = circ.toShape()
-                    wire = Part.Wire(circ_edge)
-                    info.replacement_face = Part.Face(wire)
-                except:
-                    info.replacement_face = None
+                center, radius, normal, max_dev = fit
+                rel_dev = max_dev / radius * 100 if radius > 0 else float('inf')
 
-            results.append(info)
+                is_circ = rel_dev < self.rel_tolerance
+
+                info = HoleInfo(
+                    face_index=fi,
+                    face=face,
+                    wire_index=wi,
+                    wire=wire,
+                    n_edges=len(edges),
+                    points=pts,
+                    is_circular=is_circ,
+                    fit_center=center,
+                    fit_radius=radius,
+                    fit_normal=normal,
+                    fit_max_dev=max_dev,
+                    fit_rel_dev=rel_dev,
+                )
+
+                # 创建替换面
+                if is_circ:
+                    try:
+                        circ = Part.Circle()
+                        circ.Center = center
+                        circ.Axis = Base.Vector(normal[0], normal[1], normal[2])
+                        circ.Radius = radius
+                        circ_edge = circ.toShape()
+                        new_wire = Part.Wire(circ_edge)
+
+                        # 创建带圆孔的新面
+                        outer_wire = face.Wires[0]
+                        if len(face.Wires) > 2:
+                            # 多个内孔：保留其他内孔
+                            other_inner = [face.Wires[j] for j in range(1, len(face.Wires)) if j != wi]
+                            new_face = Part.Face([outer_wire, new_wire] + other_inner)
+                        else:
+                            new_face = Part.Face([outer_wire, new_wire])
+                        info.replacement_face = new_face
+                    except Exception:
+                        info.replacement_face = None
+
+                results.append(info)
 
         return results
 
@@ -243,15 +198,15 @@ class CircularHoleDetector:
 # ============================================================================
 
 class HoleRepairDialog(QtWidgets.QDialog):
-    """STL B-Rep 多边形孔圆弧重建对话框"""
+    """B-Rep 多边形孔 → 圆孔重建对话框"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("STL B-Rep 多边形孔 → 圆弧重建")
+        self.setWindowTitle("B-Rep 多边形孔 → 圆孔重建")
         self.setMinimumSize(600, 650)
 
         self.shape_obj = None
-        self.results: List[BoundaryLoop] = []
+        self.results: List[HoleInfo] = []
 
         self._build_ui()
         self._connect()
@@ -267,6 +222,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
         gl.addWidget(QtWidgets.QLabel("B-Rep 对象:"))
         gl.addWidget(self.combo, 1)
         btn_refresh = QtWidgets.QPushButton("刷新")
+        btn_refresh.clicked.connect(self._refresh_list)
         gl.addWidget(btn_refresh)
         grp_obj.setLayout(gl)
         lay.addWidget(grp_obj)
@@ -284,7 +240,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
 
         self.spin_min = QtWidgets.QSpinBox()
         self.spin_min.setRange(3, 200)
-        self.spin_min.setValue(8)
+        self.spin_min.setValue(6)
         fl.addRow("最小边数:", self.spin_min)
 
         grp_param.setLayout(fl)
@@ -292,7 +248,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
 
         # 按钮
         bl = QtWidgets.QHBoxLayout()
-        self.btn_detect = QtWidgets.QPushButton("检测多边形圆弧孔")
+        self.btn_detect = QtWidgets.QPushButton("检测多边形孔")
         self.btn_detect.setStyleSheet("QPushButton{background:#4CAF50;color:white;padding:6px}")
         bl.addWidget(self.btn_detect)
 
@@ -363,11 +319,11 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._log("Shape: %d Faces, %d Edges, %d Solids" % (
             len(shape.Faces), len(shape.Edges), len(shape.Solids)))
 
-        detector = CircularHoleDetector(
+        detector = HoleDetector(
             rel_tolerance=self.spin_tol.value(),
             min_edges=self.spin_min.value(),
         )
-        self.results = detector.detect_and_rebuild(shape)
+        self.results = detector.detect(shape)
 
         # 更新 UI
         self.result_list.clear()
@@ -376,10 +332,14 @@ class HoleRepairDialog(QtWidgets.QDialog):
             if info.is_circular:
                 circ_count += 1
                 c = info.fit_center
-                text = "[圆弧孔] #%d  R=%.3f  中心=(%.1f,%.1f,%.1f)  偏差=%.1f%%  %d边" % (
-                    i+1, info.fit_radius, c.x, c.y, c.z, info.fit_rel_dev, info.n_edges)
+                text = "[圆弧孔] Face%d/Wire%d  R=%.3f  中心=(%.1f,%.1f,%.1f)  偏差=%.1f%%  %d边" % (
+                    info.face_index, info.wire_index,
+                    info.fit_radius, c.x, c.y, c.z,
+                    info.fit_rel_dev, info.n_edges)
             else:
-                text = "[非圆弧] #%d  %d边" % (i+1, info.n_edges)
+                text = "[非圆弧] Face%d/Wire%d  %d边  偏差=%.1f%%" % (
+                    info.face_index, info.wire_index,
+                    info.n_edges, info.fit_rel_dev)
 
             item = QtWidgets.QListWidgetItem(text)
             item.setData(QtCore.Qt.UserRole, i)
@@ -387,9 +347,9 @@ class HoleRepairDialog(QtWidgets.QDialog):
                 item.setForeground(QtCore.Qt.darkGreen)
             self.result_list.addItem(item)
 
-        self.lbl_stats.setText("边界环: %d, 圆弧孔: %d" % (len(self.results), circ_count))
+        self.lbl_stats.setText("检测到 %d 个内孔, %d 个圆弧" % (len(self.results), circ_count))
         self.btn_rebuild_all.setEnabled(circ_count > 0)
-        self._log("检测完成: %d 个边界环, %d 个圆弧孔" % (len(self.results), circ_count))
+        self._log("检测完成: %d 个内孔, %d 个圆弧孔" % (len(self.results), circ_count))
 
     def _on_sel(self):
         sel = self.result_list.selectedItems()
@@ -407,10 +367,12 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._do_rebuild(indices)
 
     def _do_rebuild(self, indices):
-        if not self.shape_obj:
+        if not self.shape_obj or not indices:
             return
 
         doc = FreeCAD.ActiveDocument
+        shape = self.shape_obj.Shape
+        faces = list(shape.Faces)
         count = 0
 
         for idx in indices:
@@ -418,17 +380,32 @@ class HoleRepairDialog(QtWidgets.QDialog):
             if not info.is_circular or info.replacement_face is None:
                 continue
 
-            new_name = "%s_CircleHole_%d" % (self.shape_obj.Name, idx)
-            new_obj = doc.addObject("Part::Feature", new_name)
-            new_obj.Shape = info.replacement_face
+            # 替换原 face
+            faces[info.face_index] = info.replacement_face
             count += 1
-            self._log("重建 #%d: R=%.3f Face" % (idx+1, info.fit_radius))
+            self._log("重建 Face%d/Wire%d: R=%.3f" % (
+                info.face_index, info.wire_index, info.fit_radius))
 
-        if count > 0:
-            doc.recompute()
-            self._log("完成: %d 个圆弧孔已重建" % count)
-        else:
+        if count == 0:
             self._log("没有可重建的圆弧孔")
+            return
+
+        # 从新 faces 重建 shape
+        try:
+            shell = Part.Shell(faces)
+            try:
+                result = Part.Solid(shell)
+            except Exception:
+                result = shell
+        except Exception:
+            result = shape
+
+        new_name = self.shape_obj.Name + "_repaired"
+        new_obj = doc.addObject("Part::Feature", new_name)
+        new_obj.Shape = result
+        doc.recompute()
+
+        self._log("完成: %s (%d 个圆弧孔已重建)" % (new_name, count))
 
     def _log(self, msg):
         self.log_text.append(msg)
@@ -442,8 +419,8 @@ class HoleRepairDialog(QtWidgets.QDialog):
 class HoleRepairCommand:
     def GetResources(self):
         return {
-            'MenuText': 'STL B-Rep 多边形孔 → 圆弧重建',
-            'ToolTip': '检测 STL 转换的 B-Rep 中的多边形孔，重建为真正的圆弧几何',
+            'MenuText': 'B-Rep 多边形孔 → 圆孔重建',
+            'ToolTip': '检测 B-Rep 中的多边形孔洞，重建为真正的圆弧几何',
         }
 
     def IsActive(self):
