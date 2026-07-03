@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<package format="1" xmlns="https://wiki.freecad.org/Package_Metadata">
+  <name>HoleRepair</name>
+  <description>Detect circular arc holes in B-Rep models and rebuild them as proper Geom_Circle geometry. Uses Kasa least-squares circle fitting (same approach as AnalysisSitus asiAlgo_RecognizeCanonical::FitCircle).</description>
+  <version>1.0.0</version>
+  <date>2026-07-03</date>
+  <maintainer email="maxmadzz@users.noreply.github.com">maxmadzz</maintainer>
+  <license file="LICENSE">MIT</license>
+  <url type="repository" branch="main">https://github.com/maxmadzz/FreeCAD-HoleRepair</url>
+  <url type="readme">https://github.com/maxmadzz/FreeCAD-HoleRepair/blob/main/README.md</url>
+  <icon>icons/hole_repair.svg</icon>
+  <tag>mesh</tag>
+  <tag>part</tag>
+  <tag>reverse-engineering</tag>
+  <freecadmin>1.0.0</freecadmin>
+  <content>
+    <workbench>
+      <classname>HoleRepairWorkbench</classname>
+      <subdirectory>./</subdirectory>
+    </workbench>
+  </content>
+</package>
