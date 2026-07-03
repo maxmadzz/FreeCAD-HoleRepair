@@ -370,20 +370,28 @@ class HoleRepairDialog(QtWidgets.QDialog):
             self._log("处理 Face%d/Wire%d: R=%.6f" % (
                 info.face_index, info.wire_index, R))
 
-            # Step 1: 创建盖片（比孔大 10%）
-            R_cover = R * 1.1
-            cover_circ = Part.Circle()
-            cover_circ.Center = c
-            cover_circ.Axis = n
-            cover_circ.Radius = R_cover
-            cover_solid = Part.Face(Part.Wire(cover_circ.toShape())).extrude(n * 5)
+            # 用 Part.makeCylinder（确保穿透模型但不超出 BB）
+            bb = result_shape.BoundBox
+            if abs(n.z) > 0.5:
+                height = bb.ZLength
+                start = Base.Vector(c.x, c.y, bb.ZMin)
+                axis = Base.Vector(0, 0, 1)
+            elif abs(n.y) > 0.5:
+                height = bb.YLength
+                start = Base.Vector(c.x, bb.YMin, c.z)
+                axis = Base.Vector(0, 1, 0)
+            else:
+                height = bb.XLength
+                start = Base.Vector(bb.XMin, c.y, c.z)
+                axis = Base.Vector(1, 0, 0)
 
-            # Step 2: 创建圆孔切割体
-            hole_circ = Part.Circle()
-            hole_circ.Center = c
-            hole_circ.Axis = n
-            hole_circ.Radius = R
-            hole_solid = Part.Face(Part.Wire(hole_circ.toShape())).extrude(n * 5)
+            # 盖片：比孔稍大的圆柱
+            R_cover = R * 1.1
+            cover_solid = Part.makeCylinder(R_cover, height, start, axis)
+
+            # 圆孔：精确半径的圆柱
+            hole_solid = Part.makeCylinder(R, height, start, axis)
+
 
             # Step 3: Fuse 盖片（覆盖多边形孔）
             result_shape = result_shape.fuse(cover_solid)
