@@ -600,29 +600,34 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._do_rebuild(indices)
 
     def _do_rebuild(self, indices):
-        """Wire 替换法重建圆孔：直接将多边形 inner wire 替换为圆 wire。
+        """Disk 盖片 + Pocket 切圆法重建圆孔。
 
-        与 Cover+Pocket 的区别：
-        - 不创建贯穿模型的圆柱
+        对每个检测到的圆弧孔：
+        1. 创建一个比孔稍大的薄圆盘（盖住多边形孔）
+        2. 布尔合并（Fuse）盖住孔
+        3. 用真正的圆 Pocket 切出精确圆孔
+
+        与 Wire 替换的区别：
+        - 不重建 Face，保持拓扑完整性
         - 不影响周围几何（槽、凸台等）
-        - BB 完全不变，面数不变
+        - BB 几乎不变
         """
         if not self.shape_obj or not indices:
             return
 
         doc = FreeCAD.ActiveDocument
-        all_faces = list(self.shape_obj.Shape.Faces)
+        result_shape = self.shape_obj.Shape
         count = 0
 
         for idx in indices:
             info = self.results[idx]
 
             if info.detection_mode == "wire" and info.is_circular:
-                fi = info.face_index
-                face = all_faces[fi]
-
-                # 拟合圆（Kasa 最小二乘，只用顶点）
+                # Wire 模式：从 inner wire 获取圆参数
                 pts = [v.Point for v in info.wire.Vertexes]
+                face = self.shape_obj.Shape.Faces[info.face_index]
+                face_normal = face.normalAt(0.5, 0.5)
+
                 coords = np.array([(p.x, p.y, p.z) for p in pts])
                 centroid = coords.mean(axis=0)
                 centered = coords - centroid
@@ -638,42 +643,49 @@ class HoleRepairDialog(QtWidgets.QDialog):
                 radius = math.sqrt(cx_2d**2 + cy_2d**2 - F)
                 center_3d = centroid + u_vec * cx_2d + v_vec * cy_2d
 
-                # 创建圆形 inner wire
-                circ = Part.Circle()
-                circ.Center = Base.Vector(center_3d[0], center_3d[1], center_3d[2])
-                circ.Axis = Base.Vector(normal_vec[0], normal_vec[1], normal_vec[2])
-                circ.Radius = radius
-                circle_wire = Part.Wire(circ.toShape())
-
-                # 替换：保留 outer wire + 其他 inner wire，只替换当前孔
-                outer_wire = face.Wires[0]
-                other_inner = [face.Wires[i] for i in range(2, len(face.Wires))]
-                try:
-                    new_face = Part.Face([outer_wire, circle_wire] + other_inner)
-                    all_faces[fi] = new_face
-                    count += 1
-                    self._log("  -> Wire 替换完成 R=%.6f" % radius)
-                except Exception as ex:
-                    self._log("  -> Wire 替换失败: %s" % ex)
+                c = Base.Vector(center_3d[0], center_3d[1], center_3d[2])
+                n = Base.Vector(face_normal.x, face_normal.y, face_normal.z)
 
             elif info.detection_mode == "cluster" and info.is_cylindrical:
-                # 面聚类检测结果 — 暂不支持 wire 替换
-                self._log("  -> 聚类模式暂不支持 wire 替换，跳过")
+                c = info.cyl_center
+                n = info.cyl_normal
+                radius = info.cyl_radius
+
+            else:
+                continue
+
+            # 面法线方向的薄厚度
+            thickness = 0.1
+
+            # 盖片：比孔稍大
+            R_cover = radius * 1.05
+            cover = Part.makeCylinder(
+                R_cover, thickness,
+                Base.Vector(c.x, c.y, c.z - thickness / 2), n)
+
+            # Pocket：精确半径
+            hole = Part.makeCylinder(
+                radius, thickness,
+                Base.Vector(c.x, c.y, c.z - thickness / 2), n)
+
+            try:
+                result_shape = result_shape.fuse(cover)
+                result_shape = result_shape.cut(hole)
+                count += 1
+                self._log("  -> Disk+Pocket 完成 R=%.6f" % radius)
+            except Exception as ex:
+                self._log("  -> Disk+Pocket 失败: %s" % ex)
 
         if count == 0:
             self._log("没有可重建的孔洞")
             return
 
-        # 用新面重建 Solid
-        try:
-            result = Part.Solid(Part.Shell(all_faces))
-            new_name = self.shape_obj.Name + "_repaired"
-            new_obj = doc.addObject("Part::Feature", new_name)
-            new_obj.Shape = result
-            doc.recompute()
-            self._log("完成: %s (%d 个孔洞已重建)" % (new_name, count))
-        except Exception as ex:
-            self._log("重建 Solid 失败: %s" % ex)
+        new_name = self.shape_obj.Name + "_repaired"
+        new_obj = doc.addObject("Part::Feature", new_name)
+        new_obj.Shape = result_shape
+        doc.recompute()
+
+        self._log("完成: %s (%d 个孔洞已重建)" % (new_name, count))
 
     def _log(self, msg):
         self.log_text.append(msg)
