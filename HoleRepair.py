@@ -600,85 +600,90 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._do_rebuild(indices)
 
     def _do_rebuild(self, indices):
-        """Disk 盖片 + Pocket 切圆法重建圆孔。
+        """批量 Cover+Pocket 法重建圆孔。
 
-        对每个检测到的圆弧孔：
-        1. 创建一个比孔稍大的薄圆盘（盖住多边形孔）
-        2. 布尔合并（Fuse）盖住孔
-        3. 用真正的圆 Pocket 切出精确圆孔
+        1. 合并所有盖片（R×1.02）为单一形状
+        2. 一次 Fuse 到模型
+        3. 合并所有 Pocket（精确R）为单一形状
+        4. 一次 Cut
 
-        与 Wire 替换的区别：
-        - 不重建 Face，保持拓扑完整性
-        - 不影响周围几何（槽、凸台等）
-        - BB 几乎不变
+        优点：BB 完全不变，不影响周围几何，布尔运算次数少。
         """
         if not self.shape_obj or not indices:
             return
 
         doc = FreeCAD.ActiveDocument
         result_shape = self.shape_obj.Shape
+        bb = result_shape.BoundBox
+        Zmin, Zmax = bb.ZMin, bb.ZMax
+        h = Zmax - Zmin
+
+        covers = []
+        pockets = []
         count = 0
 
         for idx in indices:
             info = self.results[idx]
 
             if info.detection_mode == "wire" and info.is_circular:
-                # Wire 模式：从 inner wire 获取圆参数
                 pts = [v.Point for v in info.wire.Vertexes]
-                face = self.shape_obj.Shape.Faces[info.face_index]
-                face_normal = face.normalAt(0.5, 0.5)
-
                 coords = np.array([(p.x, p.y, p.z) for p in pts])
                 centroid = coords.mean(axis=0)
                 centered = coords - centroid
                 _, _, vh = np.linalg.svd(centered)
-                normal_vec = vh[2]
+                n_vec = vh[2]
                 u_vec, v_vec = vh[0], vh[1]
                 coords_2d = centered @ np.column_stack([u_vec, v_vec])
                 x, y = coords_2d[:, 0], coords_2d[:, 1]
                 A = np.column_stack([x, y, np.ones(len(x))])
                 b_arr = -(x**2 + y**2)
                 D, E, F = np.linalg.lstsq(A, b_arr, rcond=None)[0]
-                cx_2d, cy_2d = -D / 2, -E / 2
-                radius = math.sqrt(cx_2d**2 + cy_2d**2 - F)
-                center_3d = centroid + u_vec * cx_2d + v_vec * cy_2d
+                cx2, cy2 = -D / 2, -E / 2
+                radius = math.sqrt(cx2 ** 2 + cy2 ** 2 - F)
+                c3d = centroid + u_vec * cx2 + v_vec * cy2
 
-                c = Base.Vector(center_3d[0], center_3d[1], center_3d[2])
-                n = Base.Vector(face_normal.x, face_normal.y, face_normal.z)
+                covers.append(Part.makeCylinder(
+                    radius * 1.02, h,
+                    Base.Vector(c3d[0], c3d[1], Zmin),
+                    Base.Vector(0, 0, 1)))
+                pockets.append(Part.makeCylinder(
+                    radius, h,
+                    Base.Vector(c3d[0], c3d[1], Zmin),
+                    Base.Vector(0, 0, 1)))
+                count += 1
 
             elif info.detection_mode == "cluster" and info.is_cylindrical:
                 c = info.cyl_center
-                n = info.cyl_normal
                 radius = info.cyl_radius
-
-            else:
-                continue
-
-            # 面法线方向的薄厚度
-            thickness = 0.1
-
-            # 盖片：比孔稍大
-            R_cover = radius * 1.05
-            cover = Part.makeCylinder(
-                R_cover, thickness,
-                Base.Vector(c.x, c.y, c.z - thickness / 2), n)
-
-            # Pocket：精确半径
-            hole = Part.makeCylinder(
-                radius, thickness,
-                Base.Vector(c.x, c.y, c.z - thickness / 2), n)
-
-            try:
-                result_shape = result_shape.fuse(cover)
-                result_shape = result_shape.cut(hole)
+                covers.append(Part.makeCylinder(
+                    radius * 1.02, h,
+                    Base.Vector(c.x, c.y, Zmin),
+                    Base.Vector(0, 0, 1)))
+                pockets.append(Part.makeCylinder(
+                    radius, h,
+                    Base.Vector(c.x, c.y, Zmin),
+                    Base.Vector(0, 0, 1)))
                 count += 1
-                self._log("  -> Disk+Pocket 完成 R=%.6f" % radius)
-            except Exception as ex:
-                self._log("  -> Disk+Pocket 失败: %s" % ex)
 
         if count == 0:
             self._log("没有可重建的孔洞")
             return
+
+        self._log("合并 %d 个盖片中..." % len(covers))
+        cover_multi = covers[0]
+        for c in covers[1:]:
+            cover_multi = cover_multi.fuse(c)
+
+        self._log("Fuse 盖片到模型...")
+        result_shape = result_shape.fuse(cover_multi)
+
+        self._log("合并 %d 个 pocket 中..." % len(pockets))
+        pocket_multi = pockets[0]
+        for p in pockets[1:]:
+            pocket_multi = pocket_multi.fuse(p)
+
+        self._log("Cut pocket...")
+        result_shape = result_shape.cut(pocket_multi)
 
         new_name = self.shape_obj.Name + "_repaired"
         new_obj = doc.addObject("Part::Feature", new_name)
