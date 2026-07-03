@@ -46,7 +46,6 @@ class HoleInfo:
     fit_normal: Optional[Base.Vector] = None
     fit_max_dev: float = float('inf')
     fit_rel_dev: float = float('inf')   # 相对偏差 (%)
-    replacement_face: object = None     # 重建后的面
 
 
 # ============================================================================
@@ -167,28 +166,7 @@ class HoleDetector:
                     fit_rel_dev=rel_dev,
                 )
 
-                # 创建替换面
-                if is_circ:
-                    try:
-                        circ = Part.Circle()
-                        circ.Center = center
-                        circ.Axis = Base.Vector(normal[0], normal[1], normal[2])
-                        circ.Radius = radius
-                        circ_edge = circ.toShape()
-                        new_wire = Part.Wire(circ_edge)
-
-                        # 创建带圆孔的新面
-                        outer_wire = face.Wires[0]
-                        if len(face.Wires) > 2:
-                            # 多个内孔：保留其他内孔
-                            other_inner = [face.Wires[j] for j in range(1, len(face.Wires)) if j != wi]
-                            new_face = Part.Face([outer_wire, new_wire] + other_inner)
-                        else:
-                            new_face = Part.Face([outer_wire, new_wire])
-                        info.replacement_face = new_face
-                    except Exception:
-                        info.replacement_face = None
-
+                results.append(info)
                 results.append(info)
 
         return results
@@ -368,42 +346,61 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._do_rebuild(indices)
 
     def _do_rebuild(self, indices):
+        """Cover+Pocket 方法重建圆孔：
+        1. 创建比孔稍大的圆盘（盖住多边形孔）
+        2. 布尔合并（Fuse）覆盖孔
+        3. 用真正的圆 Pocket 切出精确圆孔
+        """
         if not self.shape_obj or not indices:
             return
 
         doc = FreeCAD.ActiveDocument
-        shape = self.shape_obj.Shape
-        faces = list(shape.Faces)
+        result_shape = self.shape_obj.Shape
         count = 0
 
         for idx in indices:
             info = self.results[idx]
-            if not info.is_circular or info.replacement_face is None:
+            if not info.is_circular:
                 continue
 
-            # 替换原 face
-            faces[info.face_index] = info.replacement_face
+            c = info.fit_center
+            R = info.fit_radius
+            n = info.fit_normal
+
+            self._log("处理 Face%d/Wire%d: R=%.6f" % (
+                info.face_index, info.wire_index, R))
+
+            # Step 1: 创建盖片（比孔大 10%）
+            R_cover = R * 1.1
+            cover_circ = Part.Circle()
+            cover_circ.Center = c
+            cover_circ.Axis = n
+            cover_circ.Radius = R_cover
+            cover_solid = Part.Face(Part.Wire(cover_circ.toShape())).extrude(n * 5)
+
+            # Step 2: 创建圆孔切割体
+            hole_circ = Part.Circle()
+            hole_circ.Center = c
+            hole_circ.Axis = n
+            hole_circ.Radius = R
+            hole_solid = Part.Face(Part.Wire(hole_circ.toShape())).extrude(n * 5)
+
+            # Step 3: Fuse 盖片（覆盖多边形孔）
+            result_shape = result_shape.fuse(cover_solid)
+
+            # Step 4: Cut 圆孔
+            result_shape = result_shape.cut(hole_solid)
+
             count += 1
-            self._log("重建 Face%d/Wire%d: R=%.3f" % (
-                info.face_index, info.wire_index, info.fit_radius))
+            self._log("  -> Cover+Pocket 完成 R=%.6f" % R)
 
         if count == 0:
             self._log("没有可重建的圆弧孔")
             return
 
-        # 从新 faces 重建 shape
-        try:
-            shell = Part.Shell(faces)
-            try:
-                result = Part.Solid(shell)
-            except Exception:
-                result = shell
-        except Exception:
-            result = shape
-
         new_name = self.shape_obj.Name + "_repaired"
         new_obj = doc.addObject("Part::Feature", new_name)
-        new_obj.Shape = result
+        new_obj.Shape = result_shape
         doc.recompute()
 
         self._log("完成: %s (%d 个圆弧孔已重建)" % (new_name, count))
