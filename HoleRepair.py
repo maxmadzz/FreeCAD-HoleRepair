@@ -5,33 +5,25 @@ FreeCAD 插件：Mesh 孔洞圆弧检测与重建
 
 功能：
 1. 检测 Mesh 中的孔洞边界
-2. 识别圆弧形边界（使用 AnalysisSitus 的圆弧拟合算法）
-3. 重建圆弧形孔洞
+2. 识别圆弧形边界（最小二乘法拟合圆）
+3. 重建圆弧形孔洞（扇形三角化或调用 FreeCAD 内置 fillupHoles）
 
 依赖：
-- FreeCAD 0.20+
-- AnalysisSitus（编译后的库文件）
-- numpy
+- FreeCAD 0.20+（内置 numpy/scipy）
 """
 
 import os
-import sys
 import math
 import numpy as np
-from typing import List, Tuple, Optional, Dict, Any
-from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass, field
 from enum import Enum
 
-# FreeCAD imports
 import FreeCAD
 import FreeCADGui
 import Mesh
-import MeshPart
-import Part
 from FreeCAD import Base
-
-# PySide imports for GUI
-from PySide2 import QtWidgets, QtCore, QtGui
+from PySide6 import QtWidgets, QtCore
 
 
 # ============================================================================
@@ -39,786 +31,610 @@ from PySide2 import QtWidgets, QtCore, QtGui
 # ============================================================================
 
 class HoleType(Enum):
-    """孔洞类型"""
-    CIRCLE = "circle"           # 圆形孔洞
-    ARC = "arc"                 # 圆弧形孔洞
-    ELLIPSE = "ellipse"         # 椭圆形孔洞
-    POLYGON = "polygon"         # 多边形孔洞
-    UNKNOWN = "unknown"         # 未知类型
+    CIRCLE = "circle"
+    ARC = "arc"
+    POLYGON = "polygon"
+    UNKNOWN = "unknown"
 
 
 @dataclass
 class BoundaryLoop:
-    """边界环数据结构"""
-    vertex_indices: List[int]       # 顶点索引列表
-    edge_indices: List[Tuple[int, int]]  # 边列表（顶点对）
-    perimeter: float                # 周长
-    area: float                     # 面积（如果闭合）
-    centroid: Base.Vector           # 质心
-    hole_type: HoleType             # 孔洞类型
-    fit_circle: Optional[Any]       # 拟合的圆（如果有）
-    fit_error: float                # 拟合误差
+    """边界环"""
+    vertex_indices: List[int]                       # 顶点在 mesh.Topology[0] 中的索引
+    points: List[Base.Vector] = field(default_factory=list)  # 3D 坐标
+    perimeter: float = 0.0
+    area: float = 0.0
+    centroid: Base.Vector = field(default_factory=lambda: Base.Vector(0, 0, 0))
+    normal: Base.Vector = field(default_factory=lambda: Base.Vector(0, 0, 1))
+    hole_type: HoleType = HoleType.UNKNOWN
+    fit_center: Optional[Base.Vector] = None
+    fit_radius: float = 0.0
+    fit_error: float = float('inf')
 
 
 @dataclass
 class ArcDetectionResult:
     """圆弧检测结果"""
-    loop: BoundaryLoop              # 边界环
-    circle_center: Base.Vector      # 圆心
-    circle_radius: float            # 半径
-    circle_normal: Base.Vector      # 法向量
-    arc_start: Base.Vector          # 圆弧起点
-    arc_end: Base.Vector            # 圆弧终点
-    arc_angle: float                # 圆弧角度（弧度）
-    deviation: float                # 偏差
-    is_full_circle: bool            # 是否完整圆
+    loop: BoundaryLoop
+    center: Base.Vector
+    radius: float
+    normal: Base.Vector
+    deviation: float
+    is_full_circle: bool
+    arc_angle: float
 
 
 # ============================================================================
-# 核心算法：边界检测
+# 边界检测
 # ============================================================================
 
 class BoundaryDetector:
-    """边界检测器"""
-    
-    def __init__(self, mesh: Mesh.Mesh):
-        self.mesh = mesh
-        self.vertices = mesh.Topology[0]
-        self.faces = mesh.Topology[1]
-        self._edge_face_map = None
-        self._boundary_edges = None
-    
-    def _build_edge_face_map(self) -> Dict[Tuple[int, int], List[int]]:
-        """构建边到面的映射"""
-        if self._edge_face_map is not None:
-            return self._edge_face_map
-        
-        edge_face_map = {}
-        for face_idx, face in enumerate(self.faces):
-            for i in range(3):
-                v1 = face[i]
-                v2 = face[(i + 1) % 3]
-                edge = (min(v1, v2), max(v1, v2))
-                if edge not in edge_face_map:
-                    edge_face_map[edge] = []
-                edge_face_map[edge].append(face_idx)
-        
-        self._edge_face_map = edge_face_map
-        return edge_face_map
-    
-    def find_boundary_edges(self) -> List[Tuple[int, int]]:
-        """找到所有边界边（只属于一个面的边）"""
-        if self._boundary_edges is not None:
-            return self._boundary_edges
-        
-        edge_face_map = self._build_edge_face_map()
-        boundary_edges = []
-        
-        for edge, faces in edge_face_map.items():
-            if len(faces) == 1:  # 边界边只属于一个面
-                boundary_edges.append(edge)
-        
-        self._boundary_edges = boundary_edges
-        return boundary_edges
-    
-    def extract_boundary_loops(self) -> List[BoundaryLoop]:
+    """从 Mesh 中提取边界环"""
+
+    def __init__(self, mesh_obj):
+        """
+        Args:
+            mesh_obj: FreeCAD Mesh::Feature 对象（不是 Mesh.Mesh）
+        """
+        self.mesh_obj = mesh_obj
+        self.mesh = mesh_obj.Mesh
+        # Topology[0] 是 Base.Vector 列表，Topology[1] 是 (int,int,int) tuple 列表
+        self.vertices: List[Base.Vector] = list(self.mesh.Topology[0])
+        self.faces: List[Tuple[int, int, int]] = list(self.mesh.Topology[1])
+
+    def find_boundary_loops(self) -> List[BoundaryLoop]:
         """提取所有边界环"""
-        boundary_edges = self.find_boundary_edges()
-        
+        edge_face_map: Dict[Tuple[int, int], int] = {}
+
+        # 统计每条边被多少个面共享
+        for face in self.faces:
+            for i in range(3):
+                v1, v2 = face[i], face[(i + 1) % 3]
+                edge = (min(v1, v2), max(v1, v2))
+                edge_face_map[edge] = edge_face_map.get(edge, 0) + 1
+
+        # 边界边 = 只属于 1 个面
+        boundary_edges = {e for e, cnt in edge_face_map.items() if cnt == 1}
+
         if not boundary_edges:
             return []
-        
-        # 构建邻接表
-        adjacency = {}
+
+        # 构建邻接表（仅边界边）
+        adjacency: Dict[int, List[int]] = {}
         for v1, v2 in boundary_edges:
-            if v1 not in adjacency:
-                adjacency[v1] = []
-            if v2 not in adjacency:
-                adjacency[v2] = []
-            adjacency[v1].append(v2)
-            adjacency[v2].append(v1)
-        
-        # 提取环
-        loops = []
+            adjacency.setdefault(v1, []).append(v2)
+            adjacency.setdefault(v2, []).append(v1)
+
+        # 遍历所有边界环
         visited_edges = set()
-        
+        loops: List[BoundaryLoop] = []
+
         for start_edge in boundary_edges:
             if start_edge in visited_edges:
                 continue
-            
-            # 开始一个新的环
-            loop_vertices = []
-            loop_edges = []
-            current = start_edge[0]
-            target = start_edge[1]
-            
+
+            loop_verts = []
+            current, target = start_edge
+
             while True:
-                loop_vertices.append(current)
-                loop_edges.append((current, target))
-                visited_edges.add((min(current, target), max(current, target)))
-                
-                current = target
-                # 找到下一个未访问的邻接顶点
-                next_vertex = None
-                for neighbor in adjacency.get(current, []):
-                    edge = (min(current, neighbor), max(current, neighbor))
-                    if edge not in visited_edges:
-                        next_vertex = neighbor
-                        break
-                
-                if next_vertex is None:
+                edge_key = (min(current, target), max(current, target))
+                if edge_key in visited_edges:
                     break
-                
-                target = next_vertex
-                if current == start_edge[0] and target == start_edge[1]:
-                    break  # 回到起点
-            
-            if len(loop_vertices) >= 3:
-                # 计算环的属性
-                loop = self._analyze_loop(loop_vertices, loop_edges)
-                loops.append(loop)
-        
+                visited_edges.add(edge_key)
+                loop_verts.append(current)
+                current = target
+
+                # 找下一个未访问邻接点
+                nxt = None
+                for neighbor in adjacency.get(current, []):
+                    ek = (min(current, neighbor), max(current, neighbor))
+                    if ek not in visited_edges:
+                        nxt = neighbor
+                        break
+                if nxt is None:
+                    break
+                target = nxt
+
+            if len(loop_verts) >= 3:
+                loops.append(self._build_loop(loop_verts))
+
         return loops
-    
-    def _analyze_loop(self, vertices: List[int], edges: List[Tuple[int, int]]) -> BoundaryLoop:
-        """分析边界环的属性"""
-        # 获取顶点坐标
-        points = [Base.Vector(*self.vertices[v]) for v in vertices]
-        
-        # 计算周长
-        perimeter = 0.0
-        for i in range(len(points)):
-            p1 = points[i]
-            p2 = points[(i + 1) % len(points)]
-            perimeter += p1.distanceToPoint(p2)
-        
-        # 计算质心
+
+    def _build_loop(self, vert_indices: List[int]) -> BoundaryLoop:
+        pts = [self.vertices[v] for v in vert_indices]
+
+        # 周长
+        perim = sum(pts[i].distanceToPoint(pts[(i + 1) % len(pts)])
+                    for i in range(len(pts)))
+
+        # 质心
         centroid = Base.Vector(0, 0, 0)
-        for p in points:
+        for p in pts:
             centroid += p
-        centroid /= len(points)
-        
-        # 计算面积（使用 Shoelace 公式，假设在 XY 平面投影）
-        area = self._compute_loop_area(points)
-        
-        return BoundaryLoop(
-            vertex_indices=vertices,
-            edge_indices=edges,
-            perimeter=perimeter,
-            area=area,
-            centroid=centroid,
-            hole_type=HoleType.UNKNOWN,
-            fit_circle=None,
-            fit_error=float('inf')
-        )
-    
-    def _compute_loop_area(self, points: List[Base.Vector]) -> float:
-        """计算环的面积（投影到最佳拟合平面）"""
-        if len(points) < 3:
-            return 0.0
-        
-        # 计算法向量
-        normal = self._compute_normal(points)
-        
-        # 投影到 2D
-        projected = self._project_to_2d(points, normal)
-        
-        # Shoelace 公式
-        n = len(projected)
-        area = 0.0
-        for i in range(n):
-            j = (i + 1) % n
-            area += projected[i][0] * projected[j][1]
-            area -= projected[j][0] * projected[i][1]
-        return abs(area) / 2.0
-    
-    def _compute_normal(self, points: List[Base.Vector]) -> Base.Vector:
-        """计算点集的法向量"""
-        if len(points) < 3:
-            return Base.Vector(0, 0, 1)
-        
-        # 使用 Newell 方法计算法向量
+        centroid /= len(pts)
+
+        # 法向量 (Newell method)
         normal = Base.Vector(0, 0, 0)
-        for i in range(len(points)):
-            p1 = points[i]
-            p2 = points[(i + 1) % len(points)]
+        for i in range(len(pts)):
+            p1, p2 = pts[i], pts[(i + 1) % len(pts)]
             normal.x += (p1.y - p2.y) * (p1.z + p2.z)
             normal.y += (p1.z - p2.z) * (p1.x + p2.x)
             normal.z += (p1.x - p2.x) * (p1.y + p2.y)
-        
-        length = normal.Length
-        if length > 1e-10:
-            normal /= length
+        ln = normal.Length
+        if ln > 1e-12:
+            normal /= ln
         else:
             normal = Base.Vector(0, 0, 1)
-        
-        return normal
-    
-    def _project_to_2d(self, points: List[Base.Vector], normal: Base.Vector) -> List[Tuple[float, float]]:
-        """将 3D 点投影到 2D 平面"""
-        # 选择投影平面
-        if abs(normal.z) > abs(normal.x) and abs(normal.z) > abs(normal.y):
-            # 投影到 XY 平面
-            return [(p.x, p.y) for p in points]
-        elif abs(normal.x) > abs(normal.y):
-            # 投影到 YZ 平面
-            return [(p.y, p.z) for p in points]
+
+        # 面积 (投影到最佳拟合平面后用 Shoelace)
+        area = self._projected_area(pts, normal)
+
+        return BoundaryLoop(
+            vertex_indices=vert_indices,
+            points=pts,
+            perimeter=perim,
+            area=area,
+            centroid=centroid,
+            normal=normal,
+        )
+
+    @staticmethod
+    def _projected_area(pts: List[Base.Vector], normal: Base.Vector) -> float:
+        """投影面积（Shoelace 公式）"""
+        # 选投影平面
+        ax = abs(normal.x)
+        ay = abs(normal.y)
+        az = abs(normal.z)
+        if az >= ax and az >= ay:
+            coords = [(p.x, p.y) for p in pts]
+        elif ax >= ay:
+            coords = [(p.y, p.z) for p in pts]
         else:
-            # 投影到 XZ 平面
-            return [(p.x, p.z) for p in points]
+            coords = [(p.x, p.z) for p in pts]
+
+        n = len(coords)
+        a = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            a += coords[i][0] * coords[j][1] - coords[j][0] * coords[i][1]
+        return abs(a) / 2.0
 
 
 # ============================================================================
-# 核心算法：圆弧检测
+# 圆弧检测（纯 Python + numpy，仿 AnalysisSitus FitCircle 思路）
 # ============================================================================
 
 class ArcDetector:
-    """圆弧检测器（使用 AnalysisSitus 的算法思想）"""
-    
-    def __init__(self, tolerance: float = 0.1):
+    """
+    检测边界环是否为圆弧。
+    算法：取 3 点构造圆，再用 20+ 采样点验证偏差。
+    与 AnalysisSitus asiAlgo_RecognizeCanonical::FitCircle 同源思路。
+    """
+
+    def __init__(self, tolerance: float = 0.1, min_vertices: int = 6):
         self.tolerance = tolerance
-    
-    def detect_circle(self, loop: BoundaryLoop, vertices: List[Tuple[float, float, float]]) -> Optional[ArcDetectionResult]:
-        """检测边界环是否为圆弧"""
-        if len(loop.vertex_indices) < 3:
+        self.min_vertices = min_vertices
+
+    def detect(self, loop: BoundaryLoop) -> Optional[ArcDetectionResult]:
+        if len(loop.vertex_indices) < self.min_vertices:
             return None
-        
-        # 获取点坐标
-        points = [Base.Vector(*vertices[v]) for v in loop.vertex_indices]
-        
-        # 计算最佳拟合圆
-        circle = self._fit_circle_3d(points)
-        if circle is None:
+
+        pts = loop.points
+        n = len(pts)
+
+        # Kasa 全点最小二乘拟合圆（与 AnalysisSitus FitCircle 同源思路）
+        fit_result = self._fit_circle_kasa(pts)
+        if fit_result is None:
             return None
-        
-        center, radius, normal = circle
-        
-        # 计算偏差
-        max_deviation = 0.0
-        for p in points:
-            dist = p.distanceToPoint(center)
-            deviation = abs(dist - radius)
-            max_deviation = max(max_deviation, deviation)
-        
-        # 检查是否在容差范围内
-        if max_deviation > self.tolerance:
+
+        center, radius, normal, max_dev = fit_result
+
+        # 验证偏差
+        if max_dev > self.tolerance:
             return None
-        
+
         # 计算圆弧角度
-        arc_angle = self._compute_arc_angle(points, center, normal)
-        
-        # 判断是否为完整圆
-        is_full_circle = abs(arc_angle - 2 * math.pi) < 0.1
-        
+        arc_angle = self._arc_angle(pts, center, normal)
+        is_full = abs(arc_angle - 2 * math.pi) < 0.15
+
+        # 更新 loop 信息
+        loop.hole_type = HoleType.CIRCLE if is_full else HoleType.ARC
+        loop.fit_center = center
+        loop.fit_radius = radius
+        loop.fit_error = max_dev
+
         return ArcDetectionResult(
             loop=loop,
-            circle_center=center,
-            circle_radius=radius,
-            circle_normal=normal,
-            arc_start=points[0],
-            arc_end=points[-1],
+            center=center,
+            radius=radius,
+            normal=normal,
+            deviation=max_dev,
+            is_full_circle=is_full,
             arc_angle=arc_angle,
-            deviation=max_deviation,
-            is_full_circle=is_full_circle
         )
-    
-    def _fit_circle_3d(self, points: List[Base.Vector]) -> Optional[Tuple[Base.Vector, float, Base.Vector]]:
-        """3D 圆拟合（最小二乘法）"""
-        if len(points) < 3:
+
+    @staticmethod
+    def _circle_from_3points(p0: Base.Vector, p1: Base.Vector, p2: Base.Vector):
+        """三点定圆，返回 (center, radius, normal) 或 None"""
+        eps = 1e-9
+        d01 = p0.distanceToPoint(p1)
+        d02 = p0.distanceToPoint(p2)
+        if d01 < eps or d02 < eps:
             return None
-        
-        # 计算质心
-        centroid = Base.Vector(0, 0, 0)
-        for p in points:
-            centroid += p
-        centroid /= len(points)
-        
-        # 计算法向量（使用 SVD）
-        matrix = []
-        for p in points:
-            diff = p - centroid
-            matrix.append([diff.x, diff.y, diff.z])
-        
-        matrix = np.array(matrix)
-        _, _, vh = np.linalg.svd(matrix)
-        normal = Base.Vector(*vh[2])
-        
-        # 投影到 2D 平面
-        projected = []
-        for p in points:
-            diff = p - centroid
-            # 使用法向量构建局部坐标系
-            u = self._orthogonal_vector(normal)
-            v = normal.cross(u)
-            u.normalize()
-            v.normalize()
-            
-            x = diff.dot(u)
-            y = diff.dot(v)
-            projected.append((x, y))
-        
-        # 2D 圆拟合
-        circle_2d = self._fit_circle_2d(projected)
-        if circle_2d is None:
+
+        v01 = p1 - p0
+        v02 = p2 - p0
+        cross = v01.cross(v02)
+        cross_sq = cross.x ** 2 + cross.y ** 2 + cross.z ** 2
+        if cross_sq < d01 * d02 * eps:
+            return None  # 三点共线
+
+        # 使用 OCCT 的 gce_MakeCirc 等价算法
+        # 中垂线法
+        m1 = (p0 + p1) / 2.0
+        m2 = (p0 + p2) / 2.0
+        n = cross.normalize()
+
+        # 两条中垂线方向
+        d1 = v01.cross(n)
+        d2 = v02.cross(n)
+
+        # 解交点 (最小二乘)
+        A = np.array([[d1.x, -d2.x],
+                       [d1.y, -d2.y],
+                       [d1.z, -d2.z]])
+        b = np.array([m2.x - m1.x, m2.y - m1.y, m2.z - m1.z])
+        result = np.linalg.lstsq(A, b, rcond=None)
+        t = result[0][0]
+        center = m1 + d1 * t
+        radius = p0.distanceToPoint(center)
+
+        if radius < eps or radius > 1e6:
             return None
-        
-        cx, cy, radius = circle_2d
-        
-        # 转换回 3D
-        u = self._orthogonal_vector(normal)
-        v = normal.cross(u)
-        u.normalize()
-        v.normalize()
-        
-        center_3d = centroid + u * cx + v * cy
-        
-        return center_3d, radius, normal
-    
-    def _fit_circle_2d(self, points: List[Tuple[float, float]]) -> Optional[Tuple[float, float, float]]:
-        """2D 圆拟合（最小二乘法）"""
-        if len(points) < 3:
+
+        return center, radius, n
+
+    @staticmethod
+    def _fit_circle_kasa(points: List[Base.Vector]):
+        """
+        Kasa 最小二乘圆拟合。
+        x^2 + y^2 + Dx + Ey + F = 0
+        返回 (center, radius, normal, max_deviation) 或 None。
+        """
+        n = len(points)
+        if n < 6:
             return None
-        
-        # 构建线性方程组
-        # (x - cx)^2 + (y - cy)^2 = r^2
-        # x^2 - 2*cx*x + cx^2 + y^2 - 2*cy*y + cy^2 = r^2
-        # -2*cx*x - 2*cy*y + (cx^2 + cy^2 - r^2) = -(x^2 + y^2)
-        
-        A = []
-        b = []
-        for x, y in points:
-            A.append([-2*x, -2*y, 1])
-            b.append(-(x*x + y*y))
-        
-        A = np.array(A)
-        b = np.array(b)
-        
-        # 最小二乘求解
+
+        coords_3d = np.array([(p.x, p.y, p.z) for p in points])
+        centroid = coords_3d.mean(axis=0)
+        centered = coords_3d - centroid
+
+        # SVD 找拟合平面法向量
+        _, _, vh = np.linalg.svd(centered)
+        normal_vec = vh[2]
+        u_vec, v_vec = vh[0], vh[1]
+
+        # 投影到 2D
+        coords_2d = centered @ np.column_stack([u_vec, v_vec])
+        x, y = coords_2d[:, 0], coords_2d[:, 1]
+
+        # Kasa 拟合
+        A = np.column_stack([x, y, np.ones(n)])
+        b_arr = -(x**2 + y**2)
         try:
-            result = np.linalg.lstsq(A, b, rcond=None)
-            params = result[0]
-            cx = params[0]
-            cy = params[1]
-            radius = math.sqrt(cx*cx + cy*cy - params[2])
-            return cx, cy, radius
-        except:
+            D, E, F = np.linalg.lstsq(A, b_arr, rcond=None)[0]
+        except np.linalg.LinAlgError:
             return None
-    
-    def _orthogonal_vector(self, v: Base.Vector) -> Base.Vector:
-        """计算与给定向量正交的向量"""
-        if abs(v.x) < 0.9:
-            return Base.Vector(1, 0, 0).cross(v).normalize()
-        else:
-            return Base.Vector(0, 1, 0).cross(v).normalize()
-    
-    def _compute_arc_angle(self, points: List[Base.Vector], center: Base.Vector, normal: Base.Vector) -> float:
-        """计算圆弧角度"""
-        if len(points) < 2:
+
+        cx_2d, cy_2d = -D / 2, -E / 2
+        rad_sq = cx_2d**2 + cy_2d**2 - F
+        if rad_sq < 1e-12:
+            return None
+        radius = math.sqrt(rad_sq)
+        if radius < 1e-6 or radius > 1e6:
+            return None
+
+        # 转回 3D
+        center_3d = centroid + u_vec * cx_2d + v_vec * cy_2d
+        center = Base.Vector(center_3d[0], center_3d[1], center_3d[2])
+        normal = Base.Vector(normal_vec[0], normal_vec[1], normal_vec[2])
+
+        devs = [abs(p.distanceToPoint(center) - radius) for p in points]
+        return center, radius, normal, max(devs)
+
+    @staticmethod
+    def _arc_angle(pts: List[Base.Vector], center: Base.Vector, normal: Base.Vector) -> float:
+        """计算点序列在圆上的总弧度"""
+        n = len(pts)
+        if n < 2:
             return 0.0
-        
-        # 计算到圆心的向量
-        vectors = []
-        for p in points:
-            v = p - center
-            v.normalize()
-            vectors.append(v)
-        
-        # 计算角度和
-        total_angle = 0.0
-        for i in range(len(vectors)):
+
+        vectors = [(p - center).normalize() for p in pts]
+        total = 0.0
+        for i in range(n):
             v1 = vectors[i]
-            v2 = vectors[(i + 1) % len(vectors)]
-            dot = v1.dot(v2)
-            dot = max(-1.0, min(1.0, dot))
+            v2 = vectors[(i + 1) % n]
+            dot = max(-1.0, min(1.0, v1.dot(v2)))
             angle = math.acos(dot)
-            
-            # 检查方向
             cross = v1.cross(v2)
             if cross.dot(normal) < 0:
                 angle = -angle
-            
-            total_angle += angle
-        
-        return abs(total_angle)
+            total += angle
+        return abs(total)
 
 
 # ============================================================================
-# 核心算法：孔洞重建
+# 孔洞重建
 # ============================================================================
 
 class HoleRebuilder:
     """孔洞重建器"""
-    
-    def __init__(self, mesh: Mesh.Mesh):
-        self.mesh = mesh
-        self.vertices = list(mesh.Topology[0])
-        self.faces = list(mesh.Topology[1])
-    
-    def rebuild_circle_hole(self, result: ArcDetectionResult, 
-                           num_segments: int = 32) -> Mesh.Mesh:
-        """重建圆形孔洞"""
-        center = result.circle_center
-        radius = result.circle_radius
-        normal = result.circle_normal
-        
-        # 创建局部坐标系
-        u = self._orthogonal_vector(normal)
-        v = normal.cross(u)
-        u.normalize()
-        v.normalize()
-        
-        # 生成圆上的点
-        circle_points = []
-        for i in range(num_segments):
-            angle = 2 * math.pi * i / num_segments
-            point = center + u * (radius * math.cos(angle)) + v * (radius * math.sin(angle))
-            circle_points.append(point)
-        
-        # 获取边界点
-        boundary_points = [Base.Vector(*self.vertices[v]) for v in result.loop.vertex_indices]
-        
-        # 创建网格
+
+    @staticmethod
+    def rebuild_circle(mesh_obj, result: ArcDetectionResult, segments: int = 32) -> Mesh.Mesh:
+        """
+        重建圆形孔洞：用圆心 + 边界点做扇形三角化。
+        返回一个新的 Mesh 对象（不修改原 mesh）。
+        """
+        loop = result.loop
+        pts = loop.points
+        center = result.center
+
         new_mesh = Mesh.Mesh()
-        
-        # 添加中心点
-        center_idx = len(self.vertices)
-        self.vertices.append((center.x, center.y, center.z))
-        
-        # 添加边界点
-        boundary_start_idx = len(self.vertices)
-        for p in boundary_points:
-            self.vertices.append((p.x, p.y, p.z))
-        
-        # 创建扇形三角形
-        for i in range(len(boundary_points)):
-            j = (i + 1) % len(boundary_points)
-            v1 = boundary_start_idx + i
-            v2 = boundary_start_idx + j
-            v3 = center_idx
-            self.faces.append((v1, v2, v3))
-        
-        # 创建新网格
-        new_mesh.addMesh(self.vertices, self.faces)
+
+        # 扇形三角化：center -> pt[i] -> pt[i+1]
+        for i in range(len(pts)):
+            j = (i + 1) % len(pts)
+            new_mesh.addFacet(center, pts[i], pts[j])
+
         return new_mesh
-    
-    def rebuild_arc_hole(self, result: ArcDetectionResult,
-                        num_segments: int = 32) -> Mesh.Mesh:
-        """重建圆弧形孔洞"""
-        # 对于圆弧形孔洞，使用扇形填充
-        return self._fan_triangulation(result.loop)
-    
-    def _fan_triangulation(self, loop: BoundaryLoop) -> Mesh.Mesh:
-        """扇形三角化"""
-        boundary_points = [Base.Vector(*self.vertices[v]) for v in loop.vertex_indices]
-        
-        if len(boundary_points) < 3:
-            return self.mesh
-        
-        # 计算质心作为填充点
-        centroid = Base.Vector(0, 0, 0)
-        for p in boundary_points:
-            centroid += p
-        centroid /= len(boundary_points)
-        
-        # 添加质心点
-        center_idx = len(self.vertices)
-        self.vertices.append((centroid.x, centroid.y, centroid.z))
-        
-        # 添加边界点
-        boundary_start_idx = len(self.vertices)
-        for p in boundary_points:
-            self.vertices.append((p.x, p.y, p.z))
-        
-        # 创建扇形三角形
-        for i in range(len(boundary_points)):
-            j = (i + 1) % len(boundary_points)
-            v1 = boundary_start_idx + i
-            v2 = boundary_start_idx + j
-            v3 = center_idx
-            self.faces.append((v1, v2, v3))
-        
-        # 创建新网格
+
+    @staticmethod
+    def rebuild_generic(mesh_obj, loop: BoundaryLoop) -> Mesh.Mesh:
+        """
+        通用孔洞重建：用质心做扇形三角化。
+        """
+        pts = loop.points
+        centroid = loop.centroid
+
         new_mesh = Mesh.Mesh()
-        new_mesh.addMesh(self.vertices, self.faces)
+        for i in range(len(pts)):
+            j = (i + 1) % len(pts)
+            new_mesh.addFacet(centroid, pts[i], pts[j])
+
         return new_mesh
-    
-    def _orthogonal_vector(self, v: Base.Vector) -> Base.Vector:
-        """计算与给定向量正交的向量"""
-        if abs(v.x) < 0.9:
-            return Base.Vector(1, 0, 0).cross(v).normalize()
-        else:
-            return Base.Vector(0, 1, 0).cross(v).normalize()
+
+    @staticmethod
+    def rebuild_builtin(mesh_obj, max_radius: int = 100, tolerance: float = 0.1):
+        """
+        调用 FreeCAD 内置 fillupHoles 方法。
+        注意：maxRadius 必须是 int，tolerance 是 float。
+        """
+        mesh_obj.Mesh.fillupHoles(max_radius, int(tolerance * 1000))
 
 
 # ============================================================================
-# GUI 对话框
+# GUI
 # ============================================================================
 
 class HoleRepairDialog(QtWidgets.QDialog):
     """孔洞修复对话框"""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Mesh 孔洞圆弧检测与重建")
-        self.setMinimumWidth(500)
-        self.setMinimumHeight(600)
-        
-        # 数据
+        self.setMinimumSize(560, 620)
+
         self.mesh_obj = None
-        self.boundary_loops = []
-        self.arc_results = []
-        
-        # 创建 UI
-        self._create_ui()
-        
-        # 连接信号
-        self._connect_signals()
-    
-    def _create_ui(self):
-        """创建用户界面"""
-        layout = QtWidgets.QVBoxLayout(self)
-        
-        # 网格选择组
-        mesh_group = QtWidgets.QGroupBox("网格选择")
-        mesh_layout = QtWidgets.QHBoxLayout()
-        
+        self.loops: List[BoundaryLoop] = []
+        self.arc_results: List[ArcDetectionResult] = []
+
+        self._build_ui()
+        self._connect()
+        self._refresh_mesh_list()
+
+    # ---------- UI ----------
+
+    def _build_ui(self):
+        lay = QtWidgets.QVBoxLayout(self)
+
+        # --- 网格选择 ---
+        grp_mesh = QtWidgets.QGroupBox("网格选择")
+        gl = QtWidgets.QHBoxLayout()
         self.mesh_combo = QtWidgets.QComboBox()
-        self.mesh_combo.setMinimumWidth(300)
-        mesh_layout.addWidget(QtWidgets.QLabel("选择网格对象:"))
-        mesh_layout.addWidget(self.mesh_combo)
-        
-        self.refresh_btn = QtWidgets.QPushButton("刷新")
-        mesh_layout.addWidget(self.refresh_btn)
-        
-        mesh_group.setLayout(mesh_layout)
-        layout.addWidget(mesh_group)
-        
-        # 参数设置组
-        param_group = QtWidgets.QGroupBox("检测参数")
-        param_layout = QtWidgets.QFormLayout()
-        
-        self.tolerance_spin = QtWidgets.QDoubleSpinBox()
-        self.tolerance_spin.setRange(0.001, 10.0)
-        self.tolerance_spin.setValue(0.1)
-        self.tolerance_spin.setSingleStep(0.01)
-        param_layout.addRow("圆弧检测容差:", self.tolerance_spin)
-        
-        self.min_vertices_spin = QtWidgets.QSpinBox()
-        self.min_vertices_spin.setRange(3, 100)
-        self.min_vertices_spin.setValue(6)
-        param_layout.addRow("最小顶点数:", self.min_vertices_spin)
-        
-        self.segments_spin = QtWidgets.QSpinBox()
-        self.segments_spin.setRange(8, 128)
-        self.segments_spin.setValue(32)
-        param_layout.addRow("重建细分段数:", self.segments_spin)
-        
-        param_group.setLayout(param_layout)
-        layout.addWidget(param_group)
-        
-        # 操作按钮
-        btn_layout = QtWidgets.QHBoxLayout()
-        
-        self.detect_btn = QtWidgets.QPushButton("检测孔洞")
-        self.detect_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
-        btn_layout.addWidget(self.detect_btn)
-        
-        self.rebuild_btn = QtWidgets.QPushButton("重建选中孔洞")
-        self.rebuild_btn.setEnabled(False)
-        self.rebuild_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
-        btn_layout.addWidget(self.rebuild_btn)
-        
-        self.rebuild_all_btn = QtWidgets.QPushButton("重建所有圆弧孔洞")
-        self.rebuild_all_btn.setEnabled(False)
-        self.rebuild_all_btn.setStyleSheet("QPushButton { background-color: #FF9800; color: white; }")
-        btn_layout.addWidget(self.rebuild_all_btn)
-        
-        layout.addLayout(btn_layout)
-        
-        # 检测结果列表
-        result_group = QtWidgets.QGroupBox("检测结果")
-        result_layout = QtWidgets.QVBoxLayout()
-        
+        gl.addWidget(QtWidgets.QLabel("对象:"))
+        gl.addWidget(self.mesh_combo, 1)
+        btn_refresh = QtWidgets.QPushButton("刷新")
+        gl.addWidget(btn_refresh)
+        grp_mesh.setLayout(gl)
+        lay.addWidget(grp_mesh)
+
+        # --- 参数 ---
+        grp_param = QtWidgets.QGroupBox("检测参数")
+        fl = QtWidgets.QFormLayout()
+
+        self.spin_tol = QtWidgets.QDoubleSpinBox()
+        self.spin_tol.setRange(0.001, 10.0)
+        self.spin_tol.setValue(0.1)
+        self.spin_tol.setSingleStep(0.01)
+        fl.addRow("圆弧容差 (mm):", self.spin_tol)
+
+        self.spin_min = QtWidgets.QSpinBox()
+        self.spin_min.setRange(3, 200)
+        self.spin_min.setValue(6)
+        fl.addRow("最小顶点数:", self.spin_min)
+
+        self.spin_seg = QtWidgets.QSpinBox()
+        self.spin_seg.setRange(8, 128)
+        self.spin_seg.setValue(32)
+        fl.addRow("重建细分段:", self.spin_seg)
+
+        grp_param.setLayout(fl)
+        lay.addWidget(grp_param)
+
+        # --- 按钮 ---
+        bl = QtWidgets.QHBoxLayout()
+        self.btn_detect = QtWidgets.QPushButton("检测孔洞")
+        self.btn_detect.setStyleSheet("QPushButton{background:#4CAF50;color:white;padding:6px}")
+        bl.addWidget(self.btn_detect)
+
+        self.btn_rebuild_sel = QtWidgets.QPushButton("重建选中")
+        self.btn_rebuild_sel.setEnabled(False)
+        self.btn_rebuild_sel.setStyleSheet("QPushButton{background:#2196F3;color:white;padding:6px}")
+        bl.addWidget(self.btn_rebuild_sel)
+
+        self.btn_rebuild_all = QtWidgets.QPushButton("重建所有圆弧")
+        self.btn_rebuild_all.setEnabled(False)
+        self.btn_rebuild_all.setStyleSheet("QPushButton{background:#FF9800;color:white;padding:6px}")
+        bl.addWidget(self.btn_rebuild_all)
+
+        self.btn_fill_builtin = QtWidgets.QPushButton("FreeCAD 填充")
+        self.btn_fill_builtin.setStyleSheet("QPushButton{background:#9C27B0;color:white;padding:6px}")
+        bl.addWidget(self.btn_fill_builtin)
+        lay.addLayout(bl)
+
+        # --- 结果列表 ---
+        grp_res = QtWidgets.QGroupBox("检测结果")
+        rl = QtWidgets.QVBoxLayout()
         self.result_list = QtWidgets.QListWidget()
         self.result_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
-        result_layout.addWidget(self.result_list)
-        
-        # 统计信息
-        self.stats_label = QtWidgets.QLabel("未检测")
-        result_layout.addWidget(self.stats_label)
-        
-        result_group.setLayout(result_layout)
-        layout.addWidget(result_group)
-        
-        # 日志区域
-        log_group = QtWidgets.QGroupBox("日志")
-        log_layout = QtWidgets.QVBoxLayout()
-        
+        rl.addWidget(self.result_list)
+        self.lbl_stats = QtWidgets.QLabel("未检测")
+        rl.addWidget(self.lbl_stats)
+        grp_res.setLayout(rl)
+        lay.addWidget(grp_res)
+
+        # --- 日志 ---
+        grp_log = QtWidgets.QGroupBox("日志")
+        ll = QtWidgets.QVBoxLayout()
         self.log_text = QtWidgets.QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
-        log_layout.addWidget(self.log_text)
-        
-        log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
-        
-        # 状态栏
-        self.status_bar = QtWidgets.QStatusBar()
-        layout.addWidget(self.status_bar)
-    
-    def _connect_signals(self):
-        """连接信号和槽"""
-        self.refresh_btn.clicked.connect(self._refresh_mesh_list)
-        self.detect_btn.clicked.connect(self._detect_holes)
-        self.rebuild_btn.clicked.connect(self._rebuild_selected)
-        self.rebuild_all_btn.clicked.connect(self._rebuild_all)
-        self.result_list.itemSelectionChanged.connect(self._on_selection_changed)
-    
+        self.log_text.setMaximumHeight(120)
+        ll.addWidget(self.log_text)
+        grp_log.setLayout(ll)
+        lay.addWidget(grp_log)
+
+    def _connect(self):
+        self.mesh_combo.currentIndexChanged.connect(self._on_mesh_changed)
+        self.btn_detect.clicked.connect(self._detect)
+        self.btn_rebuild_sel.clicked.connect(self._rebuild_selected)
+        self.btn_rebuild_all.clicked.connect(self._rebuild_all)
+        self.btn_fill_builtin.clicked.connect(self._fill_builtin)
+        self.result_list.itemSelectionChanged.connect(self._on_sel_changed)
+
+    # ---------- 逻辑 ----------
+
     def _refresh_mesh_list(self):
-        """刷新网格列表"""
+        self.mesh_combo.blockSignals(True)
         self.mesh_combo.clear()
-        for obj in FreeCAD.ActiveDocument.Objects:
-            if hasattr(obj, 'Mesh'):
-                self.mesh_combo.addItem(obj.Name)
-        
-        self._log("已刷新网格列表")
-    
-    def _detect_holes(self):
-        """检测孔洞"""
-        if self.mesh_combo.count() == 0:
-            self._log("错误: 没有可用的网格对象")
+        if FreeCAD.ActiveDocument:
+            for obj in FreeCAD.ActiveDocument.Objects:
+                if obj.TypeId == "Mesh::Feature":
+                    self.mesh_combo.addItem(obj.Name)
+        self.mesh_combo.blockSignals(False)
+        self._on_mesh_changed()
+
+    def _on_mesh_changed(self):
+        name = self.mesh_combo.currentText()
+        self.mesh_obj = None
+        if FreeCAD.ActiveDocument and name:
+            obj = FreeCAD.ActiveDocument.getObject(name)
+            if obj and obj.TypeId == "Mesh::Feature":
+                self.mesh_obj = obj
+        self._log(f"选中网格: {name or '(无)'}")
+
+    def _detect(self):
+        if not self.mesh_obj:
+            self._log("错误: 请先选择网格对象")
             return
-        
-        mesh_name = self.mesh_combo.currentText()
-        obj = FreeCAD.ActiveDocument.getObject(mesh_name)
-        
-        if obj is None or not hasattr(obj, 'Mesh'):
-            self._log("错误: 无效的网格对象")
-            return
-        
-        self.mesh_obj = obj
-        mesh = obj.Mesh
-        
-        self._log(f"开始检测网格 '{mesh_name}' 的孔洞...")
-        self._log(f"  顶点数: {len(mesh.Topology[0])}")
-        self._log(f"  面数: {len(mesh.Topology[1])}")
-        
-        # 检测边界
-        detector = BoundaryDetector(mesh)
-        self.boundary_loops = detector.extract_boundary_loops()
-        
-        self._log(f"  找到 {len(self.boundary_loops)} 个边界环")
-        
-        # 检测圆弧
-        tolerance = self.tolerance_spin.value()
-        min_vertices = self.min_vertices_spin.value()
-        
-        arc_detector = ArcDetector(tolerance=tolerance)
+
+        mesh = self.mesh_obj.Mesh
+        self._log(f"检测 '{self.mesh_obj.Name}': {mesh.CountPoints} 顶点, {mesh.CountFacets} 面")
+
+        # 边界检测
+        detector = BoundaryDetector(self.mesh_obj)
+        self.loops = detector.find_boundary_loops()
+        self._log(f"找到 {len(self.loops)} 个边界环")
+
+        # 圆弧检测
+        arc_det = ArcDetector(
+            tolerance=self.spin_tol.value(),
+            min_vertices=self.spin_min.value(),
+        )
         self.arc_results = []
-        
-        for i, loop in enumerate(self.boundary_loops):
-            if len(loop.vertex_indices) < min_vertices:
-                continue
-            
-            result = arc_detector.detect_circle(loop, mesh.Topology[0])
+        for loop in self.loops:
+            result = arc_det.detect(loop)
             if result is not None:
                 self.arc_results.append(result)
-        
-        self._log(f"  检测到 {len(self.arc_results)} 个圆弧形孔洞")
-        
-        # 更新结果列表
-        self._update_result_list()
-        
-        # 更新按钮状态
-        self.rebuild_all_btn.setEnabled(len(self.arc_results) > 0)
-        
-        self._log("检测完成")
-        self.status_bar.showMessage(f"检测到 {len(self.arc_results)} 个圆弧形孔洞")
-    
-    def _update_result_list(self):
-        """更新结果列表"""
+
+        self._log(f"其中 {len(self.arc_results)} 个是圆弧形")
+
+        self._update_list()
+        self.btn_rebuild_all.setEnabled(len(self.arc_results) > 0)
+        self.lbl_stats.setText(f"边界环: {len(self.loops)}, 圆弧孔洞: {len(self.arc_results)}")
+
+    def _update_list(self):
         self.result_list.clear()
-        
-        for i, result in enumerate(self.arc_results):
-            item_text = f"孔洞 {i+1}: "
-            item_text += f"中心=({result.circle_center.x:.2f}, {result.circle_center.y:.2f}, {result.circle_center.z:.2f}), "
-            item_text += f"半径={result.circle_radius:.3f}, "
-            item_text += f"偏差={result.deviation:.4f}, "
-            item_text += f"角度={math.degrees(result.arc_angle):.1f}°"
-            
-            if result.is_full_circle:
-                item_text += " [完整圆]"
-            
-            item = QtWidgets.QListWidgetItem(item_text)
+        for i, r in enumerate(self.arc_results):
+            c = r.center
+            tag = "[整圆]" if r.is_full_circle else f"[弧 {math.degrees(r.arc_angle):.0f}°]"
+            text = (f"#{i+1}  中心=({c.x:.2f},{c.y:.2f},{c.z:.2f})  "
+                    f"R={r.radius:.3f}  偏差={r.deviation:.4f}  {tag}")
+            item = QtWidgets.QListWidgetItem(text)
             item.setData(QtCore.Qt.UserRole, i)
             self.result_list.addItem(item)
-        
-        # 更新统计信息
-        total_loops = len(self.boundary_loops)
-        arc_count = len(self.arc_results)
-        self.stats_label.setText(f"总边界环: {total_loops}, 圆弧孔洞: {arc_count}")
-    
-    def _on_selection_changed(self):
-        """选择改变时"""
-        selected = self.result_list.selectedItems()
-        self.rebuild_btn.setEnabled(len(selected) > 0)
-    
+
+    def _on_sel_changed(self):
+        self.btn_rebuild_sel.setEnabled(len(self.result_list.selectedItems()) > 0)
+
     def _rebuild_selected(self):
-        """重建选中的孔洞"""
-        selected_items = self.result_list.selectedItems()
-        if not selected_items:
-            return
-        
-        indices = [item.data(QtCore.Qt.UserRole) for item in selected_items]
-        self._rebuild_holes(indices)
-    
+        indices = [item.data(QtCore.Qt.UserRole) for item in self.result_list.selectedItems()]
+        self._do_rebuild(indices)
+
     def _rebuild_all(self):
-        """重建所有圆弧孔洞"""
-        indices = list(range(len(self.arc_results)))
-        self._rebuild_holes(indices)
-    
-    def _rebuild_holes(self, indices: List[int]):
-        """重建指定的孔洞"""
+        self._do_rebuild(list(range(len(self.arc_results))))
+
+    def _do_rebuild(self, indices: List[int]):
         if not self.mesh_obj or not self.arc_results:
             return
-        
-        self._log(f"开始重建 {len(indices)} 个孔洞...")
-        
-        mesh = self.mesh_obj.Mesh
-        rebuilder = HoleRebuilder(mesh)
-        
-        rebuilt_count = 0
+
+        self._log(f"重建 {len(indices)} 个孔洞...")
+
+        combined = Mesh.Mesh()
         for idx in indices:
-            if idx >= len(self.arc_results):
-                continue
-            
-            result = self.arc_results[idx]
-            self._log(f"  重建孔洞 {idx+1}: 半径={result.circle_radius:.3f}")
-            
-            # 根据类型选择重建方法
-            if result.is_full_circle:
-                new_mesh = rebuilder.rebuild_circle_hole(result, self.segments_spin.value())
-            else:
-                new_mesh = rebuilder.rebuild_arc_hole(result)
-            
-            rebuilt_count += 1
-        
-        # 更新网格
-        if rebuilt_count > 0:
-            # 创建新对象
-            new_obj = FreeCAD.ActiveDocument.addObject("Mesh::Feature", f"{self.mesh_obj.Name}_repaired")
-            new_obj.Mesh = rebuilder.rebuild_circle_hole(self.arc_results[indices[0]], self.segments_spin.value())
-            
-            FreeCAD.ActiveDocument.recompute()
-            self._log(f"重建完成，创建了新对象 '{new_obj.Name}'")
-            self.status_bar.showMessage(f"成功重建 {rebuilt_count} 个孔洞")
-        else:
-            self._log("没有孔洞被重建")
-    
-    def _log(self, message: str):
-        """添加日志"""
-        self.log_text.append(message)
-        FreeCAD.Console.PrintMessage(f"[HoleRepair] {message}\n")
+            r = self.arc_results[idx]
+            patch = HoleRebuilder.rebuild_circle(self.mesh_obj, r, self.spin_seg.value())
+            combined.addMesh(patch)
+            self._log(f"  #{idx+1}: R={r.radius:.3f}, {patch.CountFacets} 面片")
+
+        # 创建新对象
+        doc = FreeCAD.ActiveDocument
+        new_name = f"{self.mesh_obj.Name}_repaired"
+        new_obj = doc.addObject("Mesh::Feature", new_name)
+        new_obj.Mesh = combined
+        doc.recompute()
+
+        # 将补丁合并到原 mesh
+        self.mesh_obj.Mesh.addMesh(combined)
+        doc.recompute()
+
+        self._log(f"完成！补丁对象: {new_name}（已合并到原网格）")
+
+    def _fill_builtin(self):
+        """调用 FreeCAD 内置 fillupHoles"""
+        if not self.mesh_obj:
+            self._log("错误: 请先选择网格对象")
+            return
+        before = self.mesh_obj.Mesh.CountFacets
+        # fillupHoles(maxRadius: int, tolerance: int)
+        self.mesh_obj.Mesh.fillupHoles(100, 100)
+        FreeCAD.ActiveDocument.recompute()
+        after = self.mesh_obj.Mesh.CountFacets
+        self._log(f"FreeCAD 内置填充: {before} → {after} 面片 (增加 {after - before})")
+
+    def _log(self, msg: str):
+        self.log_text.append(msg)
+        FreeCAD.Console.PrintMessage(f"[HoleRepair] {msg}\n")
 
 
 # ============================================================================
@@ -826,45 +642,32 @@ class HoleRepairDialog(QtWidgets.QDialog):
 # ============================================================================
 
 class HoleRepairCommand:
-    """FreeCAD 命令：孔洞修复"""
-    
     def GetResources(self):
         return {
-            'Pixmap': os.path.join(os.path.dirname(__file__), 'icons', 'hole_repair.svg'),
             'MenuText': 'Mesh 孔洞圆弧检测与重建',
-            'ToolTip': '检测 Mesh 中的圆弧形孔洞并重建'
+            'ToolTip': '检测 Mesh 中的圆弧形孔洞并重建',
         }
-    
+
     def IsActive(self):
         return FreeCAD.ActiveDocument is not None
-    
+
     def Activated(self):
-        dialog = HoleRepairDialog(FreeCADGui.getMainWindow())
-        dialog.show()
+        self.dialog = HoleRepairDialog(FreeCADGui.getMainWindow())
+        self.dialog.show()
 
 
 # ============================================================================
-# 注册命令
+# 注册 / 入口
 # ============================================================================
 
 def register():
-    """注册 FreeCAD 命令"""
     FreeCADGui.addCommand('HoleRepairCommand', HoleRepairCommand())
 
-
 def unregister():
-    """注销 FreeCAD 命令"""
     FreeCADGui.removeCommand('HoleRepairCommand')
 
 
-# ============================================================================
-# 主入口
-# ============================================================================
-
 if __name__ == '__main__':
-    # 作为独立脚本运行
     register()
-    
-    # 创建对话框
     dialog = HoleRepairDialog(FreeCADGui.getMainWindow())
     dialog.show()
