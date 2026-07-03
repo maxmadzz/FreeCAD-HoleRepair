@@ -3,14 +3,17 @@
 """
 FreeCAD 插件：B-Rep 多边形孔 → 圆孔重建
 
-工作流程（参考 AnalysisSitus asiAlgo_RecognizeCanonical::FitCircle）：
-1. 遍历 B-Rep 每个 Face
-2. 检查 Face 内部 Wire（inner wire = 孔洞边界）
-3. 对每个 inner wire 做 Kasa 最小二乘圆拟合
-4. 相对偏差 < 容差 → 判定为多边形圆弧孔
-5. 用 Part.Circle 替换 inner wire，重建 Face
+支持两种检测模式（参考 AnalysisSitus asiAlgo_RecognizeCanonical）：
 
-适用场景：STL mesh → B-Rep 转换后，圆孔变成多边形碎边
+模式 A — 内孔 Wire 检测（参数化 B-Rep）
+  遍历每个 Face 的 inner Wire，Kasa 圆拟合。
+
+模式 B — 面聚类检测（mesh→B-Rep 转换后的碎面）
+  构建面邻接图 → 小平面聚类 → SVD 轴线检测 → 径向一致性检查。
+  参考 AnalysisSitus CheckIsCylindrical：curvature analysis + SVD axis。
+
+自动选择：有 inner wire → 模式 A；全是单 wire 小平面 → 模式 B。
+
 依赖：FreeCAD 1.0+（内置 numpy）
 """
 
@@ -18,6 +21,7 @@ import os
 import math
 import numpy as np
 from typing import List, Optional, Tuple
+from collections import defaultdict, Counter
 from dataclasses import dataclass, field
 
 import FreeCAD
@@ -33,11 +37,11 @@ from PySide6 import QtWidgets, QtCore
 
 @dataclass
 class HoleInfo:
-    """孔洞信息"""
-    face_index: int                     # 所在面索引
-    face: object = None                 # Part.Face
-    wire_index: int = 0                 # inner wire 索引
-    wire: object = None                 # Part.Wire
+    """孔洞信息（模式 A：inner wire 检测）"""
+    face_index: int
+    face: object = None
+    wire_index: int = 0
+    wire: object = None
     n_edges: int = 0
     points: list = field(default_factory=list)
     is_circular: bool = False
@@ -45,11 +49,29 @@ class HoleInfo:
     fit_radius: float = 0.0
     fit_normal: Optional[Base.Vector] = None
     fit_max_dev: float = float('inf')
-    fit_rel_dev: float = float('inf')   # 相对偏差 (%)
+    fit_rel_dev: float = float('inf')
+    detection_mode: str = "wire"
+
+
+@dataclass
+class ClusterInfo:
+    """聚类信息（模式 B：面聚类检测）"""
+    cluster_id: int
+    face_indices: list = field(default_factory=list)
+    face_areas: list = field(default_factory=list)
+    is_cylindrical: bool = False
+    cyl_axis_dir: Optional[np.ndarray] = None
+    cyl_axis_point: Optional[np.ndarray] = None
+    cyl_radius: float = 0.0
+    cyl_center: Optional[Base.Vector] = None
+    cyl_normal: Optional[Base.Vector] = None
+    radius_std: float = float('inf')
+    normal_alignment: float = 0.0
+    detection_mode: str = "cluster"
 
 
 # ============================================================================
-# Kasa 最小二乘圆拟合（与 AnalysisSitus FitCircle 同源思路）
+# Kasa 最小二乘圆拟合
 # ============================================================================
 
 def fit_circle_kasa(points) -> Optional[Tuple]:
@@ -100,13 +122,13 @@ def fit_circle_kasa(points) -> Optional[Tuple]:
 
 
 # ============================================================================
-# 孔洞检测：遍历 Face 的 inner Wire
+# 模式 A：inner Wire 检测（参数化 B-Rep）
 # ============================================================================
 
 class HoleDetector:
     """
     检测 B-Rep Face 中的多边形孔洞（inner Wire）。
-    参考 AnalysisSitus asiAlgo_RecognizeCanonical。
+    适用于参数化 CAD 模型（面上有内孔 Wire）。
     """
 
     def __init__(self, rel_tolerance=30.0, min_edges=6):
@@ -114,62 +136,249 @@ class HoleDetector:
         self.min_edges = min_edges
 
     def detect(self, shape) -> List[HoleInfo]:
-        """
-        遍历所有 Face，检查 inner Wire。
-        返回 HoleInfo 列表。
-        """
         results = []
-
         for fi, face in enumerate(shape.Faces):
             wires = face.Wires
             if len(wires) < 2:
-                continue  # 没有 inner wire
-
-            # Wire[0] 是外边界，Wire[1:] 是内孔
+                continue
             for wi in range(1, len(wires)):
                 wire = wires[wi]
                 edges = wire.Edges
                 if len(edges) < self.min_edges:
                     continue
-
-                # 收集离散点
-                # 只用顶点（圆应过顶点）
-                pts = []
-                for v in wire.Vertexes:
-                    pts.append(v.Point)
-
+                pts = [v.Point for v in wire.Vertexes]
                 if len(pts) < self.min_edges:
                     continue
-
-                # Kasa 圆拟合
                 fit = fit_circle_kasa(pts)
                 if fit is None:
                     continue
-
                 center, radius, normal, max_dev = fit
                 rel_dev = max_dev / radius * 100 if radius > 0 else float('inf')
-
                 is_circ = rel_dev < self.rel_tolerance
+                results.append(HoleInfo(
+                    face_index=fi, face=face, wire_index=wi, wire=wire,
+                    n_edges=len(edges), points=pts, is_circular=is_circ,
+                    fit_center=center, fit_radius=radius, fit_normal=normal,
+                    fit_max_dev=max_dev, fit_rel_dev=rel_dev,
+                    detection_mode="wire",
+                ))
+        return results
 
-                info = HoleInfo(
-                    face_index=fi,
-                    face=face,
-                    wire_index=wi,
-                    wire=wire,
-                    n_edges=len(edges),
-                    points=pts,
-                    is_circular=is_circ,
-                    fit_center=center,
-                    fit_radius=radius,
-                    fit_normal=normal,
-                    fit_max_dev=max_dev,
-                    fit_rel_dev=rel_dev,
-                )
 
-                results.append(info)
-                results.append(info)
+# ============================================================================
+# 模式 B：面聚类检测（mesh→B-Rep 碎面）
+# 参考 AnalysisSitus:
+#   - CheckIsCylindrical: curvature analysis (k1=0, k2=1/R)
+#   - AAG: face adjacency graph
+#   - RecognizeDrillHoles: connected component matching
+# ============================================================================
+
+class FaceClusterDetector:
+    """
+    检测 mesh→B-Rep 转换后由大量小平面组成的圆柱孔。
+
+    算法（参考 AnalysisSitus CheckIsCylindrical + AAG）：
+    1. 构建面邻接图（共享边的面相连）
+    2. BFS 聚类相连的小平面
+    3. 对每个聚类做 SVD 轴线检测
+    4. 检查径向一致性（std(r)/mean(r) < 阈值）
+    5. 检查法线对齐（法线 ⊥ 轴线）
+    """
+
+    def __init__(self,
+                 max_face_area=5.0,
+                 radius_tolerance=0.3,
+                 normal_tolerance=0.5,
+                 min_cluster_size=8):
+        self.max_face_area = max_face_area      # 小于此面积视为"小平面"
+        self.radius_tolerance = radius_tolerance # std(r)/mean(r) < 此值
+        self.normal_tolerance = normal_tolerance # cos(angle) < 此值表示法线 ⊥ 轴线
+        self.min_cluster_size = min_cluster_size # 最少面数
+
+    def _build_adjacency(self, shape):
+        """构建面邻接图：共享边的面相连。"""
+        # 边 → 面列表
+        edge_to_faces = defaultdict(list)
+        for fi, face in enumerate(shape.Faces):
+            for edge in face.Edges:
+                key = edge.hashCode()
+                edge_to_faces[key].append(fi)
+
+        # 面 → 邻接面集合
+        adj = defaultdict(set)
+        for edge_hash, faces in edge_to_faces.items():
+            for i in range(len(faces)):
+                for j in range(i + 1, len(faces)):
+                    adj[faces[i]].add(faces[j])
+                    adj[faces[j]].add(faces[i])
+        return adj
+
+    def _find_clusters(self, shape, adj):
+        """BFS 聚类小平面。"""
+        visited = set()
+        clusters = []
+
+        # 筛选小平面
+        small_faces = set()
+        for fi, face in enumerate(shape.Faces):
+            if face.Area < self.max_face_area:
+                small_faces.add(fi)
+
+        for fi in small_faces:
+            if fi in visited:
+                continue
+            # BFS
+            cluster = []
+            queue = [fi]
+            visited.add(fi)
+            while queue:
+                curr = queue.pop(0)
+                cluster.append(curr)
+                for neighbor in adj.get(curr, []):
+                    if neighbor not in visited and neighbor in small_faces:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            if len(cluster) >= self.min_cluster_size:
+                clusters.append(cluster)
+
+        return clusters
+
+    def _check_cylindrical(self, shape, face_indices):
+        """
+        检查一组面是否构成圆柱孔。
+        参考 AnalysisSitus CheckIsCylindrical:
+        - 圆柱面上 k1 ≈ 0, k2 = 1/R（一个方向曲率为0，另一个方向曲率为常数）
+        - 对碎面：法线方向为径向，轴线方向为法线均值的 SVD 最小分量
+        """
+        # 收集面质心和法线
+        centroids = []
+        normals = []
+        areas = []
+        for fi in face_indices:
+            face = shape.Faces[fi]
+            cg = face.CenterOfGravity
+            centroids.append([cg.x, cg.y, cg.z])
+            # 面法线（取参数域中点）
+            u_mid = (face.ParameterRange[0] + face.ParameterRange[1]) / 2
+            v_mid = (face.ParameterRange[2] + face.ParameterRange[3]) / 2
+            n = face.normalAt(u_mid, v_mid)
+            normals.append([n.x, n.y, n.z])
+            areas.append(face.Area)
+
+        centroids = np.array(centroids)
+        normals = np.array(normals)
+        areas = np.array(areas)
+
+        if len(centroids) < self.min_cluster_size:
+            return None
+
+        # === SVD 轴线检测 ===
+        # 对质心做 SVD，最小奇异值对应的方向是轴线方向
+        centroid_mean = centroids.mean(axis=0)
+        centered = centroids - centroid_mean
+        _, s, vh = np.linalg.svd(centered)
+
+        # 最小奇异值对应的方向 = 圆柱轴线
+        axis_dir = vh[2]
+
+        # === 径向一致性检查 ===
+        # 投影到 ⊥ 轴线的平面
+        proj = centered - np.outer(centered @ axis_dir, axis_dir)
+        radii = np.linalg.norm(proj, axis=1)
+
+        r_mean = radii.mean()
+        r_std = radii.std()
+        radius_cv = r_std / r_mean if r_mean > 1e-6 else float('inf')
+
+        if radius_cv > self.radius_tolerance:
+            return None
+
+        # === 法线对齐检查 ===
+        # 圆柱面上的法线应该垂直于轴线
+        # cos(angle) = |normal · axis|，应该 ≈ 0
+        dot_products = np.abs(normals @ axis_dir)
+        mean_dot = dot_products.mean()
+
+        if mean_dot > self.normal_tolerance:
+            return None
+
+        # 计算圆心（投影到 ⊥ 轴线平面上的质心均值）
+        proj_center = centroid_mean - np.dot(centroid_mean - centroids.mean(axis=0), axis_dir) * axis_dir
+        # 更精确：用加权平均
+        weights = areas / areas.sum()
+        weighted_centroid = (centroids * weights[:, np.newaxis]).sum(axis=0)
+        proj_weighted = weighted_centroid - np.dot(weighted_centroid, axis_dir) * axis_dir
+
+        center = Base.Vector(proj_weighted[0], proj_weighted[1], proj_weighted[2])
+        normal = Base.Vector(axis_dir[0], axis_dir[1], axis_dir[2])
+
+        return {
+            'axis_dir': axis_dir,
+            'axis_point': centroid_mean,
+            'radius': r_mean,
+            'center': center,
+            'normal': normal,
+            'radius_cv': radius_cv,
+            'normal_alignment': mean_dot,
+        }
+
+    def detect(self, shape) -> List[ClusterInfo]:
+        """检测所有圆柱孔聚类。"""
+        adj = self._build_adjacency(shape)
+        clusters = self._find_clusters(shape, adj)
+
+        results = []
+        for ci, cluster in enumerate(clusters):
+            result = self._check_cylindrical(shape, cluster)
+            if result is None:
+                continue
+            results.append(ClusterInfo(
+                cluster_id=ci,
+                face_indices=cluster,
+                face_areas=[shape.Faces[fi].Area for fi in cluster],
+                is_cylindrical=True,
+                cyl_axis_dir=result['axis_dir'],
+                cyl_axis_point=result['axis_point'],
+                cyl_radius=result['radius'],
+                cyl_center=result['center'],
+                cyl_normal=result['normal'],
+                radius_std=result['radius_cv'],
+                normal_alignment=result['normal_alignment'],
+                detection_mode="cluster",
+            ))
 
         return results
+
+
+# ============================================================================
+# 自动模式选择
+# ============================================================================
+
+def detect_holes(shape, rel_tolerance=30.0, min_edges=6,
+                 max_face_area=5.0, radius_tolerance=0.3):
+    """
+    自动选择检测模式：
+    - 有 inner wire 的面 → 模式 A
+    - 全是单 wire 小平面 → 模式 B
+    两种模式都运行，合并结果。
+    """
+    results = []
+
+    # 模式 A
+    detector_a = HoleDetector(rel_tolerance=rel_tolerance, min_edges=min_edges)
+    wire_results = detector_a.detect(shape)
+    results.extend(wire_results)
+
+    # 模式 B
+    detector_b = FaceClusterDetector(
+        max_face_area=max_face_area,
+        radius_tolerance=radius_tolerance,
+        min_cluster_size=min_edges,
+    )
+    cluster_results = detector_b.detect(shape)
+    results.extend(cluster_results)
+
+    return results
 
 
 # ============================================================================
@@ -182,10 +391,10 @@ class HoleRepairDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("B-Rep 多边形孔 → 圆孔重建")
-        self.setMinimumSize(600, 650)
+        self.setMinimumSize(700, 700)
 
         self.shape_obj = None
-        self.results: List[HoleInfo] = []
+        self.results = []
 
         self._build_ui()
         self._connect()
@@ -215,19 +424,31 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self.spin_tol.setValue(30.0)
         self.spin_tol.setSingleStep(5.0)
         self.spin_tol.setSuffix("%")
-        fl.addRow("相对偏差容差:", self.spin_tol)
+        fl.addRow("圆拟合相对偏差容差:", self.spin_tol)
 
         self.spin_min = QtWidgets.QSpinBox()
         self.spin_min.setRange(3, 200)
         self.spin_min.setValue(6)
-        fl.addRow("最小边数:", self.spin_min)
+        fl.addRow("最小边数/聚类面数:", self.spin_min)
+
+        self.spin_area = QtWidgets.QDoubleSpinBox()
+        self.spin_area.setRange(0.1, 1000.0)
+        self.spin_area.setValue(5.0)
+        self.spin_area.setSuffix(" mm²")
+        fl.addRow("小平面面积阈值 (模式B):", self.spin_area)
+
+        self.spin_rtol = QtWidgets.QDoubleSpinBox()
+        self.spin_rtol.setRange(0.01, 1.0)
+        self.spin_rtol.setValue(0.3)
+        self.spin_rtol.setSingleStep(0.05)
+        fl.addRow("半径变异系数阈值 (模式B):", self.spin_rtol)
 
         grp_param.setLayout(fl)
         lay.addWidget(grp_param)
 
         # 按钮
         bl = QtWidgets.QHBoxLayout()
-        self.btn_detect = QtWidgets.QPushButton("检测多边形孔")
+        self.btn_detect = QtWidgets.QPushButton("检测孔洞")
         self.btn_detect.setStyleSheet("QPushButton{background:#4CAF50;color:white;padding:6px}")
         bl.addWidget(self.btn_detect)
 
@@ -236,7 +457,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self.btn_rebuild.setStyleSheet("QPushButton{background:#2196F3;color:white;padding:6px}")
         bl.addWidget(self.btn_rebuild)
 
-        self.btn_rebuild_all = QtWidgets.QPushButton("重建所有圆弧孔")
+        self.btn_rebuild_all = QtWidgets.QPushButton("重建所有")
         self.btn_rebuild_all.setEnabled(False)
         self.btn_rebuild_all.setStyleSheet("QPushButton{background:#FF9800;color:white;padding:6px}")
         bl.addWidget(self.btn_rebuild_all)
@@ -258,7 +479,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
         ll = QtWidgets.QVBoxLayout()
         self.log_text = QtWidgets.QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(100)
+        self.log_text.setMaximumHeight(120)
         ll.addWidget(self.log_text)
         grp_log.setLayout(ll)
         lay.addWidget(grp_log)
@@ -295,62 +516,83 @@ class HoleRepairDialog(QtWidgets.QDialog):
             return
 
         shape = self.shape_obj.Shape
-        self._log("Shape: %d Faces, %d Edges, %d Solids" % (
-            len(shape.Faces), len(shape.Edges), len(shape.Solids)))
+        n_faces = len(shape.Faces)
+        n_edges = len(shape.Edges)
+        n_solids = len(shape.Solids)
+        self._log("Shape: %d Faces, %d Edges, %d Solids" % (n_faces, n_edges, n_solids))
 
-        detector = HoleDetector(
+        self.results = detect_holes(
+            shape,
             rel_tolerance=self.spin_tol.value(),
             min_edges=self.spin_min.value(),
+            max_face_area=self.spin_area.value(),
+            radius_tolerance=self.spin_rtol.value(),
         )
-        self.results = detector.detect(shape)
 
         # 更新 UI
         self.result_list.clear()
         circ_count = 0
         for i, info in enumerate(self.results):
-            if info.is_circular:
-                circ_count += 1
-                c = info.fit_center
-                text = "[圆弧孔] Face%d/Wire%d  R=%.3f  中心=(%.1f,%.1f,%.1f)  偏差=%.1f%%  %d边" % (
-                    info.face_index, info.wire_index,
-                    info.fit_radius, c.x, c.y, c.z,
-                    info.fit_rel_dev, info.n_edges)
+            if info.detection_mode == "wire":
+                if info.is_circular:
+                    circ_count += 1
+                    c = info.fit_center
+                    text = "[圆弧孔] Face%d/Wire%d  R=%.3f  中心=(%.1f,%.1f,%.1f)  偏差=%.1f%%  %d边" % (
+                        info.face_index, info.wire_index,
+                        info.fit_radius, c.x, c.y, c.z,
+                        info.fit_rel_dev, info.n_edges)
+                else:
+                    text = "[非圆弧] Face%d/Wire%d  %d边  偏差=%.1f%%" % (
+                        info.face_index, info.wire_index,
+                        info.n_edges, info.fit_rel_dev)
+            elif info.detection_mode == "cluster":
+                if info.is_cylindrical:
+                    circ_count += 1
+                    c = info.cyl_center
+                    text = "[圆柱孔] 聚类%d  %d面  R=%.3f  中心=(%.1f,%.1f,%.1f)  CV=%.3f" % (
+                        info.cluster_id, len(info.face_indices),
+                        info.cyl_radius, c.x, c.y, c.z,
+                        info.radius_std)
+                else:
+                    text = "[非圆柱] 聚类%d  %d面" % (
+                        info.cluster_id, len(info.face_indices))
             else:
-                text = "[非圆弧] Face%d/Wire%d  %d边  偏差=%.1f%%" % (
-                    info.face_index, info.wire_index,
-                    info.n_edges, info.fit_rel_dev)
+                text = "[未知] %s" % info.detection_mode
 
             item = QtWidgets.QListWidgetItem(text)
             item.setData(QtCore.Qt.UserRole, i)
-            if info.is_circular:
+            if getattr(info, 'is_circular', False) or getattr(info, 'is_cylindrical', False):
                 item.setForeground(QtCore.Qt.darkGreen)
             self.result_list.addItem(item)
 
-        self.lbl_stats.setText("检测到 %d 个内孔, %d 个圆弧" % (len(self.results), circ_count))
+        self.lbl_stats.setText("检测到 %d 个结果, %d 个匹配" % (len(self.results), circ_count))
         self.btn_rebuild_all.setEnabled(circ_count > 0)
-        self._log("检测完成: %d 个内孔, %d 个圆弧孔" % (len(self.results), circ_count))
+        self._log("检测完成: %d 个结果, %d 个匹配" % (len(self.results), circ_count))
 
     def _on_sel(self):
         sel = self.result_list.selectedItems()
-        self.btn_rebuild.setEnabled(any(
-            self.results[item.data(QtCore.Qt.UserRole)].is_circular
-            for item in sel
-        ))
+        has_circular = False
+        for item in sel:
+            idx = item.data(QtCore.Qt.UserRole)
+            info = self.results[idx]
+            if getattr(info, 'is_circular', False) or getattr(info, 'is_cylindrical', False):
+                has_circular = True
+                break
+        self.btn_rebuild.setEnabled(has_circular)
 
     def _rebuild_sel(self):
         indices = [item.data(QtCore.Qt.UserRole) for item in self.result_list.selectedItems()]
         self._do_rebuild(indices)
 
     def _rebuild_all(self):
-        indices = [i for i, info in enumerate(self.results) if info.is_circular]
+        indices = []
+        for i, info in enumerate(self.results):
+            if getattr(info, 'is_circular', False) or getattr(info, 'is_cylindrical', False):
+                indices.append(i)
         self._do_rebuild(indices)
 
     def _do_rebuild(self, indices):
-        """Cover+Pocket 方法重建圆孔：
-        1. 创建比孔稍大的圆盘（盖住多边形孔）
-        2. 布尔合并（Fuse）覆盖孔
-        3. 用真正的圆 Pocket 切出精确圆孔
-        """
+        """Cover+Pocket 方法重建圆孔。"""
         if not self.shape_obj or not indices:
             return
 
@@ -360,17 +602,22 @@ class HoleRepairDialog(QtWidgets.QDialog):
 
         for idx in indices:
             info = self.results[idx]
-            if not info.is_circular:
+
+            # 获取圆参数
+            if info.detection_mode == "wire":
+                c = info.fit_center
+                R = info.fit_radius
+                n = info.fit_normal
+            elif info.detection_mode == "cluster":
+                c = info.cyl_center
+                R = info.cyl_radius
+                n = info.cyl_normal
+            else:
                 continue
 
-            c = info.fit_center
-            R = info.fit_radius
-            n = info.fit_normal
+            self._log("处理 R=%.6f 中心=(%.1f,%.1f,%.1f)" % (R, c.x, c.y, c.z))
 
-            self._log("处理 Face%d/Wire%d: R=%.6f" % (
-                info.face_index, info.wire_index, R))
-
-            # 用 Part.makeCylinder（确保穿透模型但不超出 BB）
+            # Part.makeCylinder（确保穿透模型但不超出 BB）
             bb = result_shape.BoundBox
             if abs(n.z) > 0.5:
                 height = bb.ZLength
@@ -385,25 +632,18 @@ class HoleRepairDialog(QtWidgets.QDialog):
                 start = Base.Vector(bb.XMin, c.y, c.z)
                 axis = Base.Vector(1, 0, 0)
 
-            # 盖片：比孔稍大的圆柱
             R_cover = R * 1.1
             cover_solid = Part.makeCylinder(R_cover, height, start, axis)
-
-            # 圆孔：精确半径的圆柱
             hole_solid = Part.makeCylinder(R, height, start, axis)
 
-
-            # Step 3: Fuse 盖片（覆盖多边形孔）
             result_shape = result_shape.fuse(cover_solid)
-
-            # Step 4: Cut 圆孔
             result_shape = result_shape.cut(hole_solid)
 
             count += 1
             self._log("  -> Cover+Pocket 完成 R=%.6f" % R)
 
         if count == 0:
-            self._log("没有可重建的圆弧孔")
+            self._log("没有可重建的孔洞")
             return
 
         new_name = self.shape_obj.Name + "_repaired"
@@ -411,7 +651,7 @@ class HoleRepairDialog(QtWidgets.QDialog):
         new_obj.Shape = result_shape
         doc.recompute()
 
-        self._log("完成: %s (%d 个圆弧孔已重建)" % (new_name, count))
+        self._log("完成: %s (%d 个孔洞已重建)" % (new_name, count))
 
     def _log(self, msg):
         self.log_text.append(msg)
@@ -426,7 +666,7 @@ class HoleRepairCommand:
     def GetResources(self):
         return {
             'MenuText': 'B-Rep 多边形孔 → 圆孔重建',
-            'ToolTip': '检测 B-Rep 中的多边形孔洞，重建为真正的圆弧几何',
+            'ToolTip': '检测 B-Rep 中的多边形孔洞（支持 mesh 转换的碎面），重建为真正的圆弧几何',
         }
 
     def IsActive(self):
