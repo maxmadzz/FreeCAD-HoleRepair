@@ -592,66 +592,80 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._do_rebuild(indices)
 
     def _do_rebuild(self, indices):
-        """Cover+Pocket 方法重建圆孔。"""
+        """Wire 替换法重建圆孔：直接将多边形 inner wire 替换为圆 wire。
+
+        与 Cover+Pocket 的区别：
+        - 不创建贯穿模型的圆柱
+        - 不影响周围几何（槽、凸台等）
+        - BB 完全不变，面数不变
+        """
         if not self.shape_obj or not indices:
             return
 
         doc = FreeCAD.ActiveDocument
-        result_shape = self.shape_obj.Shape
+        all_faces = list(self.shape_obj.Shape.Faces)
         count = 0
 
         for idx in indices:
             info = self.results[idx]
 
-            # 获取圆参数
-            if info.detection_mode == "wire":
-                c = info.fit_center
-                R = info.fit_radius
-                n = info.fit_normal
-            elif info.detection_mode == "cluster":
-                c = info.cyl_center
-                R = info.cyl_radius
-                n = info.cyl_normal
-            else:
-                continue
+            if info.detection_mode == "wire" and info.is_circular:
+                fi = info.face_index
+                face = all_faces[fi]
 
-            self._log("处理 R=%.6f 中心=(%.1f,%.1f,%.1f)" % (R, c.x, c.y, c.z))
+                # 拟合圆（Kasa 最小二乘，只用顶点）
+                pts = [v.Point for v in info.wire.Vertexes]
+                coords = np.array([(p.x, p.y, p.z) for p in pts])
+                centroid = coords.mean(axis=0)
+                centered = coords - centroid
+                _, _, vh = np.linalg.svd(centered)
+                normal_vec = vh[2]
+                u_vec, v_vec = vh[0], vh[1]
+                coords_2d = centered @ np.column_stack([u_vec, v_vec])
+                x, y = coords_2d[:, 0], coords_2d[:, 1]
+                A = np.column_stack([x, y, np.ones(len(x))])
+                b_arr = -(x**2 + y**2)
+                D, E, F = np.linalg.lstsq(A, b_arr, rcond=None)[0]
+                cx_2d, cy_2d = -D / 2, -E / 2
+                radius = math.sqrt(cx_2d**2 + cy_2d**2 - F)
+                center_3d = centroid + u_vec * cx_2d + v_vec * cy_2d
 
-            # Part.makeCylinder（确保穿透模型但不超出 BB）
-            bb = result_shape.BoundBox
-            if abs(n.z) > 0.5:
-                height = bb.ZLength
-                start = Base.Vector(c.x, c.y, bb.ZMin)
-                axis = Base.Vector(0, 0, 1)
-            elif abs(n.y) > 0.5:
-                height = bb.YLength
-                start = Base.Vector(c.x, bb.YMin, c.z)
-                axis = Base.Vector(0, 1, 0)
-            else:
-                height = bb.XLength
-                start = Base.Vector(bb.XMin, c.y, c.z)
-                axis = Base.Vector(1, 0, 0)
+                # 创建圆形 inner wire
+                circ = Part.Circle()
+                circ.Center = Base.Vector(center_3d[0], center_3d[1], center_3d[2])
+                circ.Axis = Base.Vector(normal_vec[0], normal_vec[1], normal_vec[2])
+                circ.Radius = radius
+                circle_wire = Part.Wire(circ.toShape())
 
-            R_cover = R * 1.1
-            cover_solid = Part.makeCylinder(R_cover, height, start, axis)
-            hole_solid = Part.makeCylinder(R, height, start, axis)
+                # 替换：保留 outer wire + 其他 inner wire，只替换当前孔
+                outer_wire = face.Wires[0]
+                other_inner = [face.Wires[i] for i in range(2, len(face.Wires))]
+                try:
+                    new_face = Part.Face([outer_wire, circle_wire] + other_inner)
+                    all_faces[fi] = new_face
+                    count += 1
+                    self._log("  -> Wire 替换完成 R=%.6f" % radius)
+                except Exception as ex:
+                    self._log("  -> Wire 替换失败: %s" % ex)
 
-            result_shape = result_shape.fuse(cover_solid)
-            result_shape = result_shape.cut(hole_solid)
-
-            count += 1
-            self._log("  -> Cover+Pocket 完成 R=%.6f" % R)
+            elif info.detection_mode == "cluster" and info.is_cylindrical:
+                # 面聚类检测结果 — 暂不支持 wire 替换
+                self._log("  -> 聚类模式暂不支持 wire 替换，跳过")
 
         if count == 0:
             self._log("没有可重建的孔洞")
             return
 
-        new_name = self.shape_obj.Name + "_repaired"
-        new_obj = doc.addObject("Part::Feature", new_name)
-        new_obj.Shape = result_shape
-        doc.recompute()
-
-        self._log("完成: %s (%d 个孔洞已重建)" % (new_name, count))
+        # 用新面重建 Solid
+        try:
+            result = Part.Solid(Part.Shell(all_faces))
+            new_name = self.shape_obj.Name + "_repaired"
+            new_obj = doc.addObject("Part::Feature", new_name)
+            new_obj.Shape = result
+            doc.recompute()
+            self._log("完成: %s (%d 个孔洞已重建)" % (new_name, count))
+        except Exception as ex:
+            self._log("重建 Solid 失败: %s" % ex)
 
     def _log(self, msg):
         self.log_text.append(msg)
