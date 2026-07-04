@@ -517,6 +517,22 @@ class HoleRepairDialog(QtWidgets.QDialog):
                 self.shape_obj = obj
         self._log("选中: %s" % (name or "(无)"))
 
+    def _highlight(self, idx):
+        """在 3D 视图中高亮选中孔对应的面。"""
+        info = self.results[idx]
+        FreeCADGui.Selection.clearSelection()
+        obj_name = self.shape_obj.Name if self.shape_obj else ""
+
+        if info.detection_mode == "wire":
+            FreeCADGui.Selection.addSelection(
+                FreeCAD.ActiveDocument.getObject(obj_name),
+                "Face%d" % (info.face_index + 1))
+        elif info.detection_mode == "cluster":
+            for fi in info.face_indices:
+                FreeCADGui.Selection.addSelection(
+                    FreeCAD.ActiveDocument.getObject(obj_name),
+                    "Face%d" % (fi + 1))
+
     def _detect(self):
         if not self.shape_obj:
             self._log("错误: 请选择 B-Rep 对象")
@@ -567,11 +583,28 @@ class HoleRepairDialog(QtWidgets.QDialog):
             else:
                 text = "[未知] %s" % info.detection_mode
 
-            item = QtWidgets.QListWidgetItem(text)
-            item.setData(QtCore.Qt.UserRole, i)
+            # custom item widget: label + highlight button
+            row_widget = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(4, 1, 4, 1)
+            row_layout.setSpacing(6)
+
+            lbl = QtWidgets.QLabel(text)
             if getattr(info, 'is_circular', False) or getattr(info, 'is_cylindrical', False):
-                item.setForeground(QtCore.Qt.darkGreen)
+                lbl.setStyleSheet("color:darkgreen")
+            row_layout.addWidget(lbl, 1)
+
+            btn_hl = QtWidgets.QPushButton("🔍")
+            btn_hl.setFixedSize(28, 22)
+            btn_hl.setToolTip("高亮孔面")
+            btn_hl.clicked.connect(lambda checked, idx=i: self._highlight(idx))
+            row_layout.addWidget(btn_hl)
+
+            item = QtWidgets.QListWidgetItem()
+            item.setData(QtCore.Qt.UserRole, i)
+            item.setSizeHint(row_widget.sizeHint())
             self.result_list.addItem(item)
+            self.result_list.setItemWidget(item, row_widget)
 
         self.lbl_stats.setText("检测到 %d 个结果, %d 个匹配" % (len(self.results), circ_count))
         self.btn_rebuild_all.setEnabled(circ_count > 0)
