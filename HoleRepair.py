@@ -754,6 +754,9 @@ class HoleRepairDialog(QtWidgets.QDialog):
 # ============================================================================
 
 class HoleRepairCommand:
+    def __init__(self):
+        self.dialog = None
+
     def GetResources(self):
         return {
             'MenuText': 'B-Rep 多边形孔 → 圆孔重建',
@@ -764,8 +767,16 @@ class HoleRepairCommand:
         return FreeCAD.ActiveDocument is not None
 
     def Activated(self):
-        self.dialog = HoleRepairDialog(FreeCADGui.getMainWindow())
+        if self.dialog is None:
+            self.dialog = HoleRepairDialog(FreeCADGui.getMainWindow())
+            self.dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+            self.dialog.destroyed.connect(self._on_dialog_closed)
         self.dialog.show()
+        self.dialog.raise_()
+        self.dialog.activateWindow()
+
+    def _on_dialog_closed(self):
+        self.dialog = None
 
 
 def register():
