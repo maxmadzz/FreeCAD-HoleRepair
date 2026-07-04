@@ -518,20 +518,29 @@ class HoleRepairDialog(QtWidgets.QDialog):
         self._log("选中: %s" % (name or "(无)"))
 
     def _highlight(self, idx):
-        """在 3D 视图中高亮选中孔对应的面。"""
+        """高亮孔的内环边 + 镜头聚焦。"""
         info = self.results[idx]
+        obj = self.shape_obj
+        if not obj:
+            return
+
         FreeCADGui.Selection.clearSelection()
-        obj_name = self.shape_obj.Name if self.shape_obj else ""
 
         if info.detection_mode == "wire":
-            FreeCADGui.Selection.addSelection(
-                FreeCAD.ActiveDocument.getObject(obj_name),
-                "Face%d" % (info.face_index + 1))
+            # 选中内环的所有边（比选中面更清晰）
+            for edge in info.wire.Edges:
+                for i, shape_edge in enumerate(obj.Shape.Edges):
+                    if abs(shape_edge.Length - edge.Length) < 1e-6 and \
+                       (shape_edge.Vertexes[0].Point - edge.Vertexes[0].Point).Length < 1e-6:
+                        FreeCADGui.Selection.addSelection(obj, "Edge%d" % (i + 1))
+                        break
+
         elif info.detection_mode == "cluster":
             for fi in info.face_indices:
-                FreeCADGui.Selection.addSelection(
-                    FreeCAD.ActiveDocument.getObject(obj_name),
-                    "Face%d" % (fi + 1))
+                FreeCADGui.Selection.addSelection(obj, "Face%d" % (fi + 1))
+
+        # 镜头聚焦到选中
+        FreeCADGui.SendMsgToActiveView("ViewFit")
 
     def _detect(self):
         if not self.shape_obj:
