@@ -122,6 +122,171 @@ def fit_circle_kasa(points) -> Optional[Tuple]:
 
 
 # ============================================================================
+# OCCT 曲面曲率分析（参考 AnalysisSitus asiAlgo_RecognizeCanonical）
+# ============================================================================
+
+def _surface_derivatives(surf, u, v, du=1e-4):
+    """用有限差分计算曲面的 Su, Sv, Suu, Suv, Svv。"""
+    def p(ui, vi):
+        vec = surf.value(ui, vi)
+        return np.array([vec.x, vec.y, vec.z])
+    Su  = (p(u+du, v)   - p(u-du, v))   / (2*du)
+    Sv  = (p(u, v+du)   - p(u, v-du))   / (2*du)
+    Suu = (p(u+du, v)   - 2*p(u,v)      + p(u-du, v))   / (du*du)
+    Suv = (p(u+du, v+du) - p(u+du, v-du) - p(u-du, v+du) + p(u-du, v-du)) / (4*du*du)
+    Svv = (p(u, v+du)   - 2*p(u,v)      + p(u, v-du))   / (du*du)
+    return Su, Sv, Suu, Suv, Svv
+
+
+def _principal_curvatures(Su, Sv, Suu, Suv, Svv):
+    """从导数计算主曲率 k1, k2（参考 CheckIsCylindrical EvaluateCurvature）。"""
+    n = np.cross(Su, Sv)
+    n_norm = np.linalg.norm(n)
+    if n_norm < 1e-12:
+        return None, None
+    n = n / n_norm
+
+    E = np.dot(Su, Su)
+    F = np.dot(Su, Sv)
+    G = np.dot(Sv, Sv)
+    L = np.dot(n, Suu)
+    M = np.dot(n, Suv)
+    N = np.dot(n, Svv)
+
+    denom = E*G - F*F
+    if abs(denom) < 1e-30:
+        return None, None
+
+    H = (E*N + G*L - 2*F*M) / (2*denom)   # Mean curvature
+    K = (L*N - M*M) / denom                # Gaussian curvature
+    disc = H*H - K
+    if disc < 0:
+        disc = 0.0
+    sqrt_disc = math.sqrt(disc)
+    k1 = H + sqrt_disc
+    k2 = H - sqrt_disc
+    return k1, k2
+
+
+def _cylinder_axis_from_normals(surf, u_min, u_max, v_min, v_max):
+    """用曲面上两点法线的叉积求圆柱轴线方向。
+    圆柱面上法线 = 径向 → 任意两个非平行法线的叉积 = 轴线方向。
+    参考 AnalysisSitus CheckIsCylindrical: 'axis = isCurvedU ? D1v : D1u'。
+    """
+    n_vecs = []
+    for frac_u in [0.2, 0.5, 0.8]:
+        for frac_v in [0.2, 0.5, 0.8]:
+            u = u_min + (u_max - u_min) * frac_u
+            v = v_min + (v_max - v_min) * frac_v
+            Su, Sv, _, _, _ = _surface_derivatives(surf, u, v)
+            n = np.cross(Su, Sv)
+            nn = np.linalg.norm(n)
+            if nn > 1e-12:
+                n_vecs.append(n / nn)
+
+    if len(n_vecs) < 2:
+        return None
+
+    # 找两个非平行的法线
+    for i in range(len(n_vecs)):
+        for j in range(i + 1, len(n_vecs)):
+            if abs(np.dot(n_vecs[i], n_vecs[j])) < 0.9:
+                axis = np.cross(n_vecs[i], n_vecs[j])
+                na = np.linalg.norm(axis)
+                if na > 1e-12:
+                    return axis / na
+    return None
+
+
+def check_is_cylindrical(face, toler=1e-3):
+    """
+    曲率分析检测面是否为圆柱面。
+    参考 AnalysisSitus CheckIsCylindrical:
+    - 10×10 网格采样
+    - 检查 k1≈0, k2=1/R（一个方向曲率为 0，另一个方向为常数）
+    - 法线叉积求轴线方向
+    - 沿法线移动 R 求圆心
+
+    返回 (radius, axis_dir_vec, center_vec) 或 None。
+    """
+    surf = face.Surface
+    u_min, u_max, v_min, v_max = face.ParameterRange
+
+    steps = 10
+    k1_vals, k2_vals = [], []
+    sample_pts = []
+    for i in range(steps + 1):
+        u = u_min + (u_max - u_min) * i / steps
+        for j in range(steps + 1):
+            v = v_min + (v_max - v_min) * j / steps
+            Su, Sv, Suu, Suv, Svv = _surface_derivatives(surf, u, v)
+            k1, k2 = _principal_curvatures(Su, Sv, Suu, Suv, Svv)
+            if k1 is None:
+                continue
+            k1_vals.append(k1)
+            k2_vals.append(k2)
+            sample_pts.append((u, v))
+
+    if len(k1_vals) < 4:
+        return None
+
+    k1_arr = np.array(k1_vals)
+    k2_arr = np.array(k2_vals)
+
+    # 判断哪个曲率对应圆柱轴向（≈0），哪个对应周向（=1/R）
+    zero_curv_idx = 0 if abs(k1_arr).mean() < abs(k2_arr).mean() else 1
+    k_zero_arr = k1_arr if zero_curv_idx == 0 else k2_arr
+    k_const_arr = k2_arr if zero_curv_idx == 0 else k1_arr
+
+    # 零曲率均值应 ≈ 0
+    if abs(k_zero_arr).mean() > 0.5:
+        return None
+
+    # 常数曲率应稳定（变异系数 < 30%）
+    k_const_mean = k_const_arr.mean()
+    if abs(k_const_mean) > 0:
+        k_cv = k_const_arr.std() / abs(k_const_mean)
+    else:
+        k_cv = float('inf')
+
+    if k_cv > 0.3:
+        return None
+
+    radius = 1.0 / abs(k_const_mean) if abs(k_const_mean) > 1e-10 else 0.0
+    if radius < 0.01 or radius > 1e6:
+        return None
+
+    # 法线叉积 → 轴线方向
+    axis_dir = _cylinder_axis_from_normals(surf, u_min, u_max, v_min, v_max)
+    if axis_dir is None:
+        return None
+
+    # 取中间点 → 法线方向 → 圆心
+    mid_u = (u_min + u_max) * 0.5
+    mid_v = (v_min + v_max) * 0.5
+    Su_mid, Sv_mid, _, _, _ = _surface_derivatives(surf, mid_u, mid_v)
+    n_mid = np.cross(Su_mid, Sv_mid)
+    n_norm = np.linalg.norm(n_mid)
+    if n_norm < 1e-12:
+        return None
+    n_mid = n_mid / n_norm
+
+    # 法线方向：如果是内部孔壁，法线指向轴线
+    if face.Orientation == 'Reversed':  # OCCT: 法线朝内
+        n_mid = -n_mid
+
+    p_mid = np.array([surf.value(mid_u, mid_v).x,
+                       surf.value(mid_u, mid_v).y,
+                       surf.value(mid_u, mid_v).z])
+    # 圆心 = 面上点 + 法线 × 半径
+    center = p_mid + n_mid * radius
+
+    return (radius,
+            Base.Vector(axis_dir[0], axis_dir[1], axis_dir[2]),
+            Base.Vector(center[0], center[1], center[2]))
+
+
+# ============================================================================
 # 模式 A：inner Wire 检测（参数化 B-Rep）
 # ============================================================================
 
@@ -323,8 +488,88 @@ class FaceClusterDetector:
             'normal_alignment': mean_dot,
         }
 
+    def _check_is_bore(self, shape, face_indices, axis_dir, axis_point):
+        """检查聚类是内孔还是外圆。
+        参考 AnalysisSitus RecognizeDrillHoles::isInternal。
+
+        用表面自然法线 + Orientation 显式计算面向法线，再与径向对比：
+        - 内孔壁面法线指向轴线 → dot(face_norm, radial) < 0
+        - 外圆壁面法线远离轴线 → dot(face_norm, radial) > 0
+        """
+        toward_count = 0
+        total = 0
+        for fi in face_indices:
+            face = shape.Faces[fi]
+            surf = face.Surface
+            u_min, u_max, v_min, v_max = face.ParameterRange
+            u_mid = (u_min + u_max) * 0.5
+            v_mid = (v_min + v_max) * 0.5
+
+            du = 1e-4
+            def sv(ui, vi):
+                vv = surf.value(ui, vi)
+                return np.array([vv.x, vv.y, vv.z])
+            Su = (sv(u_mid+du, v_mid) - sv(u_mid-du, v_mid)) / (2*du)
+            Sv = (sv(u_mid, v_mid+du) - sv(u_mid, v_mid-du)) / (2*du)
+            natural_n = np.cross(Su, Sv)
+            nn = np.linalg.norm(natural_n)
+            if nn < 1e-12:
+                continue
+            natural_n /= nn
+
+            if face.Orientation == 'Reversed':
+                fn = -natural_n
+            else:
+                fn = natural_n
+
+            p = sv(u_mid, v_mid)
+            to_axis = p - axis_point
+            radial = to_axis - np.dot(to_axis, axis_dir) * axis_dir
+            rn = np.linalg.norm(radial)
+            if rn < 1e-12:
+                continue
+            radial_dir = radial / rn
+
+            dot = np.dot(fn, radial_dir)
+            if dot < -0.3:
+                toward_count += 1
+            total += 1
+
+        return total > 0 and toward_count / total > 0.5
+
+    def _refine_axis_from_normals(self, shape, face_indices):
+        """用面法线的 SVD 精化聚类轴线方向。
+        
+        圆柱面上所有法线在 ⊥ 轴线的平面内 → 法线集合的最小方差方向 = 轴线。
+        比质心 SVD 更鲁棒（不受圆柱长短影响），适用于 mesh→B-Rep 碎面。
+        参考 AnalysisSitus: 面法线 = 径向 → 法线平面法向量 = 轴线。
+        """
+        n_matrix = []
+        for fi in face_indices:
+            face = shape.Faces[fi]
+            surf = face.Surface
+            pr = face.ParameterRange
+            u_mid = (pr[0] + pr[1]) * 0.5
+            v_mid = (pr[2] + pr[3]) * 0.5
+            du = 1e-4
+            Su = (surf.value(u_mid+du, v_mid) - surf.value(u_mid-du, v_mid)) / (2*du)
+            Sv = (surf.value(u_mid, v_mid+du) - surf.value(u_mid, v_mid-du)) / (2*du)
+            n = Su.cross(Sv)
+            nl = n.Length
+            if nl > 1e-12:
+                n.normalize()
+                n_matrix.append([n.x, n.y, n.z])
+
+        if len(n_matrix) < 3:
+            return None
+
+        N = np.array(n_matrix)
+        _, _, vh = np.linalg.svd(N, full_matrices=False)
+        axis_dir = vh[2]
+        return axis_dir / np.linalg.norm(axis_dir)
+
     def detect(self, shape) -> List[ClusterInfo]:
-        """检测所有圆柱孔聚类。"""
+        """检测所有圆柱聚类，排除外圆凸台。"""
         adj = self._build_adjacency(shape)
         clusters = self._find_clusters(shape, adj)
 
@@ -333,18 +578,43 @@ class FaceClusterDetector:
             result = self._check_cylindrical(shape, cluster)
             if result is None:
                 continue
+
+            is_bore = self._check_is_bore(
+                shape, cluster,
+                result['axis_dir'], result['axis_point'],
+            )
+
+            refined = result
+            if is_bore:
+                # 用法线 SVD 精化轴线（比单面曲率或质心 SVD 更鲁棒）
+                refined_axis = self._refine_axis_from_normals(shape, cluster)
+                if refined_axis is not None:
+                    refined = dict(result)
+                    refined['axis_dir'] = refined_axis
+                    # 沿新轴线重新计算圆心
+                    centroid_mean = np.array([
+                        np.mean([shape.Faces[fi].CenterOfGravity.x for fi in cluster]),
+                        np.mean([shape.Faces[fi].CenterOfGravity.y for fi in cluster]),
+                        np.mean([shape.Faces[fi].CenterOfGravity.z for fi in cluster]),
+                    ])
+                    proj_center = centroid_mean - np.dot(centroid_mean, refined_axis) * refined_axis
+                    refined_center = Base.Vector(proj_center[0], proj_center[1], proj_center[2])
+                    refined['center'] = refined_center
+                    refined['axis_point'] = centroid_mean
+                    refined['normal'] = Base.Vector(refined_axis[0], refined_axis[1], refined_axis[2])
+
             results.append(ClusterInfo(
                 cluster_id=ci,
                 face_indices=cluster,
                 face_areas=[shape.Faces[fi].Area for fi in cluster],
-                is_cylindrical=True,
-                cyl_axis_dir=result['axis_dir'],
-                cyl_axis_point=result['axis_point'],
-                cyl_radius=result['radius'],
-                cyl_center=result['center'],
-                cyl_normal=result['normal'],
-                radius_std=result['radius_cv'],
-                normal_alignment=result['normal_alignment'],
+                is_cylindrical=is_bore,
+                cyl_axis_dir=refined['axis_dir'],
+                cyl_axis_point=refined['axis_point'],
+                cyl_radius=refined['radius'],
+                cyl_center=refined['center'],
+                cyl_normal=refined['normal'],
+                radius_std=refined['radius_cv'],
+                normal_alignment=refined['normal_alignment'],
                 detection_mode="cluster",
             ))
 
@@ -641,32 +911,62 @@ class HoleRepairDialog(QtWidgets.QDialog):
                 indices.append(i)
         self._do_rebuild(indices)
 
-    def _get_hole_zrange(self, shape, face, wire, center, radius):
-        """用 ancestorsOfType 找孔内环边相邻面的 Z 范围。
+    def _get_hole_extent(self, shape, face, wire, center, axis_dir, margin=0.0):
+        """沿轴线投影找孔深范围。
 
-        遍历 inner wire 每条边 → ancestorsOfType(edge, Face) → 取 Z extent。
+        遍历 inner wire 每条边 → ancestorsOfType(edge, Face)
+        → 取邻接面顶点 → 投影到 axis_dir → min/max。
+        参考 AnalysisSitus RecognizeDrillHoles: 沿孔壁面法线方向取深度。
         """
-        z_vals = []
+        vals = []
         for edge in wire.Edges:
-            ancestors = shape.ancestorsOfType(edge, Part.Face)
-            for a in ancestors:
-                bb = a.BoundBox
-                z_vals.append(bb.ZMin)
-                z_vals.append(bb.ZMax)
-        if not z_vals:
-            # 回退：用面自身的 Z
+            for a in shape.ancestorsOfType(edge, Part.Face):
+                for v in a.Vertexes:
+                    p = Base.Vector(v.X, v.Y, v.Z)
+                    t = (p - center).dot(axis_dir)
+                    vals.append(t)
+        if not vals:
+            # 回退：用面自身 BoundBox 沿轴投影
             bb = face.BoundBox
-            return bb.ZMin, bb.ZMax
-        return min(z_vals), max(z_vals)
+            corners = [
+                Base.Vector(bb.XMin, bb.YMin, bb.ZMin),
+                Base.Vector(bb.XMax, bb.YMin, bb.ZMin),
+                Base.Vector(bb.XMin, bb.YMax, bb.ZMin),
+                Base.Vector(bb.XMin, bb.YMin, bb.ZMax),
+                Base.Vector(bb.XMax, bb.YMax, bb.ZMin),
+                Base.Vector(bb.XMax, bb.YMin, bb.ZMax),
+                Base.Vector(bb.XMin, bb.YMax, bb.ZMax),
+                Base.Vector(bb.XMax, bb.YMax, bb.ZMax),
+            ]
+            for p in corners:
+                t = (p - center).dot(axis_dir)
+                vals.append(t)
+        return min(vals) - margin, max(vals) + margin
+
+    def _get_wall_axis(self, shape, face, wire):
+        """用曲率分析从孔壁面提取圆柱轴线。
+        跳过孔所在的平面（面自身），只检测壁面。
+        参考 AnalysisSitus CheckIsCylindrical + visitNeighborCylinders。
+        返回 (axis_dir_vec, radius, center) 或 None。
+        """
+        for edge in wire.Edges:
+            for a in shape.ancestorsOfType(edge, Part.Face):
+                if a.hashCode() == face.hashCode():
+                    continue  # 跳过孔所在的平面
+                result = check_is_cylindrical(a)
+                if result is not None:
+                    return result
+        return None
 
     def _do_rebuild(self, indices):
-        """Ring+Pocket 圆孔重建。
+        """Ring+Pocket 圆孔重建（支持任意轴向）。
 
         对每个孔：
-        1. ancestorsOfType 找孔壁面 → Z 范围（自动适配台阶孔/盲孔）
-        2. 创建大圆环（R×1.2 - R×0.8）→ 堵多边形棱角
-        3. 创建精确 pocket 圆柱（R）→ 切出真圆孔
-        4. 批量 fuse 所有圆环 + 批量 cut 所有 pocket
+        1. 用曲率分析提取孔壁面圆柱轴线（参考 CheckIsCylindrical）
+        2. 沿轴线投影 → 孔深范围
+        3. 创建大圆环（R×1.2 - R×0.8）→ 堵多边形棱角
+        4. 创建精确 pocket 圆柱（R）→ 切出真圆孔
+        5. 批量 fuse 所有圆环 + 批量 cut 所有 pocket
         """
         if not self.shape_obj or not indices:
             return
@@ -679,54 +979,105 @@ class HoleRepairDialog(QtWidgets.QDialog):
         pockets = []
         count = 0
 
+        # 收集每个孔的 (axis, center, radius, t_lo, t_hi)
+        hole_params = []
+
         for idx in indices:
             info = self.results[idx]
+            axis_dir = None
+            c = None
+            radius = None
+            t_lo = t_hi = None
 
             if info.detection_mode == "wire" and info.is_circular:
                 face = shape.Faces[info.face_index]
                 if len(face.Wires) != 2:
                     continue
 
-                pts = [v.Point for v in info.wire.Vertexes]
-                coords = np.array([(p.x, p.y, p.z) for p in pts])
-                centroid = coords.mean(axis=0)
-                centered = coords - centroid
-                _, _, vh = np.linalg.svd(centered)
-                u_vec, v_vec = vh[0], vh[1]
-                coords_2d = centered @ np.column_stack([u_vec, v_vec])
-                x, y = coords_2d[:, 0], coords_2d[:, 1]
-                A = np.column_stack([x, y, np.ones(len(x))])
-                D, E, F = np.linalg.lstsq(A, -(x**2 + y**2), rcond=None)[0]
-                cx2, cy2 = -D / 2, -E / 2
-                radius = math.sqrt(cx2 ** 2 + cy2 ** 2 - F)
-                c3d = centroid + u_vec * cx2 + v_vec * cy2
-                c = Base.Vector(c3d[0], c3d[1], c3d[2])
+                # 优先级 1：曲率分析从壁面提取轴线（最精确）
+                wall = self._get_wall_axis(shape, face, info.wire)
+                if wall is not None:
+                    r_cyl, axis_dir, cyl_center = wall
+                    c = cyl_center
+                    radius = r_cyl
+                else:
+                    # 优先级 2：Kasa SVD 法线（大多数情况足够）
+                    c = info.fit_center
+                    radius = info.fit_radius
+                    axis_dir = info.fit_normal
 
-                z_lo, z_hi = self._get_hole_zrange(shape, face, info.wire, c, radius)
-                h = z_hi - z_lo
+                # 优先级 3：回退到 Z 轴
+                if axis_dir is None or axis_dir.Length < 0.5:
+                    axis_dir = Base.Vector(0, 0, 1)
+                else:
+                    axis_dir.normalize()
+
+                # 沿轴线找孔深
+                try:
+                    t_lo, t_hi = self._get_hole_extent(shape, face, info.wire, c, axis_dir)
+                except Exception:
+                    t_lo, t_hi = None, None
+
+                if t_lo is None or t_hi is None or (t_hi - t_lo) < 0.01:
+                    # 回退：全局 BBox 沿轴投影
+                    bb = shape.BoundBox
+                    corners_bb = [
+                        Base.Vector(bb.XMin, bb.YMin, bb.ZMin),
+                        Base.Vector(bb.XMax, bb.YMin, bb.ZMin),
+                        Base.Vector(bb.XMin, bb.YMax, bb.ZMin),
+                        Base.Vector(bb.XMin, bb.YMin, bb.ZMax),
+                        Base.Vector(bb.XMax, bb.YMax, bb.ZMin),
+                        Base.Vector(bb.XMax, bb.YMin, bb.ZMax),
+                        Base.Vector(bb.XMin, bb.YMax, bb.ZMax),
+                        Base.Vector(bb.XMax, bb.YMax, bb.ZMax),
+                    ]
+                    t_vals = [(p - c).dot(axis_dir) for p in corners_bb]
+                    t_lo, t_hi = min(t_vals), max(t_vals)
+
+                h = t_hi - t_lo
                 if h < 0.01:
                     continue
 
-                R_o, R_i = radius * 1.2, radius * 0.8
-                cyl_o = Part.makeCylinder(R_o, h, Base.Vector(c.x, c.y, z_lo), Base.Vector(0, 0, 1))
-                cyl_i = Part.makeCylinder(R_i, h, Base.Vector(c.x, c.y, z_lo), Base.Vector(0, 0, 1))
-                rings.append(cyl_o.cut(cyl_i))
-                pockets.append(Part.makeCylinder(radius, h, Base.Vector(c.x, c.y, z_lo), Base.Vector(0, 0, 1)))
-                count += 1
+                hole_params.append((axis_dir, c, radius, t_lo, t_hi))
 
             elif info.detection_mode == "cluster" and info.is_cylindrical:
                 c = info.cyl_center
                 radius = info.cyl_radius
-                z_lo, z_hi = shape.BoundBox.ZMin, shape.BoundBox.ZMax
-                h = z_hi - z_lo
+                axis_dir = info.cyl_normal
+                if axis_dir is None or axis_dir.Length < 0.5:
+                    axis_dir = Base.Vector(0, 0, 1)
+                else:
+                    axis_dir.normalize()
+
+                # 沿轴线找孔深
+                t_vals = []
+                for fi in info.face_indices:
+                    f = shape.Faces[fi]
+                    for v in f.Vertexes:
+                        p = Base.Vector(v.X, v.Y, v.Z)
+                        t = (p - c).dot(axis_dir)
+                        t_vals.append(t)
+                if not t_vals:
+                    t_lo, t_hi = -0.5, 0.5
+                else:
+                    t_lo, t_hi = min(t_vals), max(t_vals)
+
+                h = t_hi - t_lo
                 if h < 0.01:
                     continue
-                R_o, R_i = radius * 1.2, radius * 0.8
-                cyl_o = Part.makeCylinder(R_o, h, Base.Vector(c.x, c.y, z_lo), Base.Vector(0, 0, 1))
-                cyl_i = Part.makeCylinder(R_i, h, Base.Vector(c.x, c.y, z_lo), Base.Vector(0, 0, 1))
-                rings.append(cyl_o.cut(cyl_i))
-                pockets.append(Part.makeCylinder(radius, h, Base.Vector(c.x, c.y, z_lo), Base.Vector(0, 0, 1)))
-                count += 1
+                hole_params.append((axis_dir, c, radius, t_lo, t_hi))
+
+        # 批量创建 Ring (R×1.2 - R×0.8) + Pocket (R×1.0)
+        for axis_dir, c, radius, t_lo, t_hi in hole_params:
+            h = t_hi - t_lo
+            R_o = radius * 1.2
+            R_i = radius * 0.8
+            start_point = c + axis_dir * t_lo
+            cyl_o = Part.makeCylinder(R_o, h, start_point, axis_dir)
+            cyl_i = Part.makeCylinder(R_i, h, start_point, axis_dir)
+            rings.append(cyl_o.cut(cyl_i))
+            pockets.append(Part.makeCylinder(radius, h, start_point, axis_dir))
+            count += 1
 
         if count == 0:
             self._log("没有可重建的孔洞")
@@ -736,6 +1087,12 @@ class HoleRepairDialog(QtWidgets.QDialog):
         result_shape = result_shape.fuse(Part.makeCompound(rings))
         self._log("Pocket %d 圆孔..." % len(pockets))
         result_shape = result_shape.cut(Part.makeCompound(pockets))
+
+        # Refine: 合并共面面，消除布尔拼接痕
+        try:
+            result_shape = Part.RefineShape(result_shape)
+        except Exception:
+            pass
 
         new_name = self.shape_obj.Name + "_repaired"
         new_obj = doc.addObject("Part::Feature", new_name)
